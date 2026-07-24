@@ -54,6 +54,7 @@ class ModelArgs(BaseModelArgs):
     # Kept for checkpoint-config compatibility; unused unless use_rope=True.
     rope_theta: float = 10000.0
     rope_scaling: Optional[Dict[str, Any]] = None
+    partial_rotary_factor: float = 1.0  # was silently dropped by from_dict
     max_position_embeddings: int = 1048576
     tie_word_embeddings: bool = False
     attention_bias: bool = False
@@ -68,10 +69,11 @@ class ModelArgs(BaseModelArgs):
     linear_attn_config: Optional[Dict[str, Any]] = None
     kda_use_full_proj: bool = False
     kda_gate_lower_bound: Optional[float] = -5.0
-    # HF SolarOpen2Config default is False (beta in [0, 1]); the shipped
-    # checkpoint config sets it explicitly to true, so real-model behavior
-    # is unchanged either way.
-    kda_allow_neg_eigval: bool = False
+    # HF SolarOpen2Config's *code* default is True (configuration:145; its
+    # docstring wrongly says False); the shipped checkpoint config sets it
+    # explicitly to true, so real-model behavior is unchanged either way.
+    # Match the HF code default.
+    kda_allow_neg_eigval: bool = True
     # MoE options.
     n_routed_experts: int = 320
     n_shared_experts: int = 1
@@ -400,7 +402,7 @@ class SolarFullAttention(nn.Module):
 
         if self.use_rope:
             self.rope = initialize_rope(
-                self.head_dim,
+                int(self.head_dim * args.partial_rotary_factor),
                 base=args.rope_theta,
                 traditional=False,
                 scaling_config=args.rope_scaling,
@@ -707,7 +709,11 @@ def sanitize_layer_weights(
             gu_key = f"{mlp_prefix}.experts.gate_up_proj"
             if gu_key in weights:
                 gu = weights.pop(gu_key)
-                gate_w, up_w = mx.split(gu, 2, axis=1)
+                # mlx#3836: mx.split silently corrupts >2**31-element tensors;
+                # a fused HF-layout gate_up_proj (E, 2I, H) is 1.56x that for
+                # this model. Use strided slices instead.
+                half = gu.shape[1] // 2
+                gate_w, up_w = gu[:, :half], gu[:, half:]
                 weights[f"{mlp_prefix}.switch_mlp.gate_proj.weight"] = mx.contiguous(
                     gate_w
                 )
