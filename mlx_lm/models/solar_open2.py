@@ -817,13 +817,42 @@ class Model(nn.Module):
 
         return predicate
 
-    @property
-    def quant_predicate(self):
+    def quant_predicate_builder(self, group_size: int, bits: int):
+        """Per-tensor bit assignment for Solar-Open2.
+
+        The CLI global ``bits``/``group_size`` apply to the routed experts
+        only (they dominate the parameter count, so they alone decide the
+        model size). Everything else follows the runbook intent — sensitive
+        paths run one tier up:
+
+        - router (``mlp.gate``) → 8b/g64: routing is selection-sensitive
+          and the tensor is tiny (320 x 4096 per layer).
+        - KDA low-rank chokepoints (``f_a/f_b/g_a/g_b/b_proj``) → 8b/g64:
+          these feed the recurrent state, so quantization error compounds
+          across time steps.
+        - ``embed_tokens`` / ``lm_head`` → 6b/g64 (8b when the global is 8).
+        - attention q/k/v/o, GQA elementwise gate (``g_proj``), and the
+          shared expert → global bits + 2 (capped at 8).
+
+        At bits=8/g64 this reproduces the uniform 8-bit map, so the recipe
+        is a no-op for the reference build.
+        """
+        attn_bits = min(bits + 2, 8)
+        embed_bits = max(6, min(bits, 8))
+        chokepoint = ("f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+        upper = ("q_proj", "k_proj", "v_proj", "o_proj", "g_proj", "shared_experts")
+
         def predicate(path, _):
-            # Keep the router at 8 bits: routing is selection-sensitive and
-            # the tensor is tiny (320 x 4096 per layer).
             if path.endswith("mlp.gate"):
                 return {"group_size": 64, "bits": 8}
+            if "switch_mlp" in path:
+                return True  # routed experts take the global CLI values
+            if any(k in path for k in chokepoint) or path.endswith("b_proj"):
+                return {"group_size": 64, "bits": 8}
+            if "embed_tokens" in path or "lm_head" in path:
+                return {"group_size": 64, "bits": embed_bits}
+            if any(k in path for k in upper):
+                return {"group_size": 64, "bits": attn_bits}
             return True
 
         return predicate

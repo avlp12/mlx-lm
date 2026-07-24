@@ -849,8 +849,15 @@ def quantize_model(
 
     quantized_config = copy.deepcopy(config)
 
-    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
     group_size, bits = defaults_for_mode(mode, group_size, bits)
+    if quant_predicate is None:
+        # Models may expose a builder that adapts the predicate to the
+        # global (CLI) quantization parameters.
+        builder = getattr(model, "quant_predicate_builder", None)
+        if builder is not None:
+            quant_predicate = builder(group_size, bits)
+        else:
+            quant_predicate = getattr(model, "quant_predicate", None)
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
