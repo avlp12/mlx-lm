@@ -100,7 +100,9 @@ def quantized_scaled_dot_product_attention(
     )
 
     if n_repeats > 1:
-        out = mx.reshape(out, (B, n_q_heads, L, D))
+        # out's last dim is the value dim, which may differ from the qk dim D
+        # (e.g. Motif GDLA: qk 192, v 128)
+        out = mx.reshape(out, (B, n_q_heads, L, out.shape[-1]))
 
     return out
 

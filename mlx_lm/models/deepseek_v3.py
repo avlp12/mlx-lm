@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, Optional
@@ -341,22 +342,32 @@ class DeepseekV3Model(PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(h, cache[0], return_array=True)
 
-        # Receive from the previous process in the pipeline
+        # Receive from the previous process in the pipeline. Run cross-node comm on the
+        # CPU stream so the GPU command buffer doesn't block on the network wait — else
+        # macOS' GPU watchdog kills it (kIOGPUCommandBufferCallbackErrorTimeout).
+        _cpu = mx.cpu if pipeline_size > 1 else None
         if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1), stream=_cpu)
 
-        for l, c in zip(self.pipeline_layers, cache):
+        # Break the per-rank GPU command buffer every few layers so no single buffer runs
+        # past the watchdog (env MLX_LM_EVAL_EVERY_LAYERS, 0=off; only useful when sharded).
+        # Needed on BOTH prefill and decode: the periodic eval also breaks the GPU buffer's
+        # dependency on the CPU-stream recv, so the GPU doesn't idle-wait past the watchdog.
+        _ee = int(os.environ.get("MLX_LM_EVAL_EVERY_LAYERS", "0")) if pipeline_size > 1 else 0
+        for _i, (l, c) in enumerate(zip(self.pipeline_layers, cache)):
             h = l(h, mask, cache=c)
+            if _ee and (_i + 1) % _ee == 0:
+                mx.eval(h)
 
-        # Send to the next process in the pipeline
+        # Send to the next process in the pipeline (CPU stream, see above)
         if pipeline_rank != 0:
-            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size, stream=_cpu)
             if cache[-1] is not None:
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
-            h = mx.distributed.all_gather(h)[: h.shape[0]]
+            h = mx.distributed.all_gather(h, stream=_cpu)[: h.shape[0]]
 
         return self.norm(h)
 

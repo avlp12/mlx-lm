@@ -78,6 +78,7 @@ def dwq_quantize(
     dtype: mx.Dtype = mx.bfloat16,
     gradient_checkpoint: bool = False,
     temperature: float = 2.0,
+    pipeline: bool = False,
 ):
     group = mx.distributed.init()
     world_size = group.size()
@@ -121,7 +122,10 @@ def dwq_quantize(
         (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
             params, inputs, targets, lengths
         )
-        grads = nn.average_gradients(grads)
+        # Pipeline parallel: each rank holds DIFFERENT layers, so averaging grads
+        # across ranks (data-parallel logic) is wrong. Only average for data-parallel.
+        if not (pipeline and world_size > 1):
+            grads = nn.average_gradients(grads)
         params = opt.apply_gradients(grads, params)
         return loss, ntoks, params
 
@@ -382,12 +386,23 @@ def main():
             return model(batch)
 
     if args.quantized_model is not None:
-        q_model, tokenizer, config = load(
-            args.quantized_model,
-            lazy=True,
-            return_config=True,
-            trust_remote_code=args.trust_remote_code,
-        )
+        if args.pipeline and group.size() > 1:
+            # Shard the student across the pipeline so each node holds only ~half
+            # the layers (a 238GB student backward OOMs on one node otherwise).
+            q_model, tokenizer, config = sharded_load(
+                args.quantized_model,
+                pipeline_group=mx.distributed.init(),
+                tensor_group=None,
+                return_config=True,
+                trust_remote_code=args.trust_remote_code,
+            )
+        else:
+            q_model, tokenizer, config = load(
+                args.quantized_model,
+                lazy=True,
+                return_config=True,
+                trust_remote_code=args.trust_remote_code,
+            )
         if "quantization" not in config:
             raise ValueError("Quantized model must already be quantized.")
     else:
@@ -418,6 +433,7 @@ def main():
         max_seq_length=args.max_seq_length,
         seed=args.seed,
         gradient_checkpoint=args.grad_checkpoint,
+        pipeline=args.pipeline,
     )
     save(
         args.mlx_path,

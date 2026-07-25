@@ -140,6 +140,18 @@ deepseek_v2_awq = AWQConfig(
     ],
 )
 
+
+# GLM-5.2 / DeepSeek-V3.2 use the q-LoRA query path (q_a_proj/q_b_proj), not q_proj.
+glm_moe_dsa_awq = copy.deepcopy(deepseek_v2_awq)
+glm_moe_dsa_awq.no_clip = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "indexer"]
+glm_moe_dsa_awq.scale_configs[0].layers = ["q_a_proj", "kv_a_proj_with_mqa"]
+# sanitize() decomposes kv_b_proj -> embed_q/unembed_out (MultiLinear), which AWQ
+# cannot scale through the nn.Linear path; drop the deepseek_v2 kv_b_proj config.
+glm_moe_dsa_awq.scale_configs = [
+    c for c in glm_moe_dsa_awq.scale_configs if c.layers != ["self_attn.kv_b_proj"]
+]
+
+
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
@@ -148,6 +160,10 @@ AWQ_MODEL_CONFIGS = {
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
+    # GLM-5.2 / DeepSeek-V3.2 share deepseek_v2's MLA + MoE module layout
+    # (kv_a_proj_with_mqa/kv_b_proj, switch_mlp/shared_experts, dense gate/up/down).
+    "deepseek_v32": glm_moe_dsa_awq,
+    "glm_moe_dsa": glm_moe_dsa_awq,
 }
 
 
@@ -172,11 +188,12 @@ def run_layer(
     y = []
     for i in range(0, x.shape[0], batch_size):
         if indices is not None:
-            y.append(
-                layer(x[i : i + batch_size], indices[i : i + batch_size], **kwargs)
-            )
+            out = layer(x[i : i + batch_size], indices[i : i + batch_size], **kwargs)
         else:
-            y.append(layer(x[i : i + batch_size], **kwargs))
+            out = layer(x[i : i + batch_size], **kwargs)
+        # Some decoder layers (e.g. glm_moe_dsa with IndexShare) return
+        # (hidden, topk_indices); keep only the hidden states here.
+        y.append(out[0] if isinstance(out, tuple) else out)
         mx.eval(y)
     y = mx.concatenate(y, axis=0)
     return y
@@ -208,6 +225,8 @@ def search_best_scale(
 
     block = block or layers[0]
     out = block(x, **layer_kwargs)
+    if isinstance(out, tuple):  # glm_moe_dsa DecoderLayer returns (hidden, topk)
+        out = out[0]
 
     x_max = x.abs().mean(axis=(0, 1))
 
@@ -385,11 +404,17 @@ def clip_block(
         if isinstance(module, (nn.Linear, SwitchLinear)) and all(
             k not in path for k in no_clip_keys
         ):
+            # SwitchLinear stacks n_experts along axis 0, so search_best_clip's
+            # default batch_size=64 over (n_experts*out_features) rows means
+            # ~24k tiny GPU launches per expert weight (launch-overhead bound).
+            # Vectorize with a large batch for stacked experts.
+            bs = 4096 if isinstance(module, SwitchLinear) else 64
             best_weight = search_best_clip(
                 module,
                 quantize_func=quantize_func,
                 group_size=group_size,
                 n_grid=n_grid,
+                batch_size=bs,
             )
             module.weight = best_weight
 
@@ -415,7 +440,7 @@ def awq_quantize(
         wq = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(*wq, bits=bits, group_size=group_size)
 
-    mask = create_attention_mask(inputs)
+    mask = create_attention_mask(inputs, return_array=True)
 
     embed_key = awq_config.embed
     model.model[embed_key] = model.model[embed_key].to_quantized(

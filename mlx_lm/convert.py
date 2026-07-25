@@ -148,6 +148,22 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
+        # If the source checkpoint is already quantized (e.g. Kimi/DeepSeek
+        # compressed-tensors INT4 experts), dequantize in-memory first so the
+        # quant predicate can re-quantize those layers to the target bits.
+        # Without this, already-quantized layers lack `to_quantized`, the
+        # predicate skips them, and they stay locked at the source bit-width
+        # (mlx-lm#907: asking 3-bit yields ~4.985 bpw). MLX lazy eval keeps the
+        # dequant->requant streaming per-tensor -> no 2TB intermediate / no
+        # full-model RAM blowup.
+        if any(
+            hasattr(m, "bits") and hasattr(m, "scales")
+            for _, m in model.named_modules()
+        ):
+            print("[INFO] Source is pre-quantized; dequantizing in-memory before re-quantizing")
+            config.pop("quantization", None)
+            config.pop("quantization_config", None)
+            model = dequantize_model(model)
         print("[INFO] Quantizing")
         model, config = quantize_model(
             model,
