@@ -367,8 +367,12 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
+        # Resolve the adapter with the caller-facing key *before* rebinding
+        # model_path — the adapter map is keyed by the unmapped name (e.g.
+        # "default_model"), so looking it up after the remap always misses
+        # and silently drops --adapter-path.
         adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
