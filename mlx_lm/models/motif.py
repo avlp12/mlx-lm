@@ -145,6 +145,59 @@ def _poly_fused(x, w, b, sig, scale):
     return y if scale == 1.0 else scale * y
 
 
+# 글루 융합(게이트/MoE결합/어텐션 에필로그) — PolyNorm과 동일 디스패치-폭탄 클래스.
+# 킬스위치 MOTIF_COMPILE_GLUE=0. 형상-캐시 컴파일(디코드 형상 소수).
+_COMPILE_GLUE = os.environ.get("MOTIF_COMPILE_GLUE", "1") == "1"
+
+
+@mx.compile
+def _gate_fused(logits, expert_bias, top_k, route_norm, route_scale):
+    scores = mx.sigmoid(logits.astype(mx.float32))
+    biased = scores + expert_bias.astype(mx.float32)
+    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    w = mx.take_along_axis(scores, inds, axis=-1)
+    if route_norm:
+        w = w / (w.sum(axis=-1, keepdims=True) + 1e-20)
+    return inds, w * route_scale
+
+
+@mx.compile
+def _moe_combine(y, scores, shared):
+    return (y * scores[..., None]).sum(axis=-2).astype(shared.dtype) + shared
+
+
+@mx.compile
+def _mhc_prepost(hp, hq, a_pre, b_pre, a_post, b_post, coeff):
+    h_pre = mx.sigmoid(mx.clip(a_pre * hp + b_pre, -10.0, 10.0))
+    h_post = mx.sigmoid(mx.clip(a_post * hq + b_post, -10.0, 10.0))
+    return h_pre, (h_post if coeff == 1.0 else h_post * coeff)
+
+
+@mx.compile
+def _mhc_premix(x, h_pre):
+    return (x * h_pre[..., None]).sum(axis=2).astype(x.dtype)
+
+
+@mx.compile
+def _mhc_postmix(h_res, x, h_post, a):
+    dt = a.dtype
+    return (mx.matmul(h_res, x.astype(mx.float32)).astype(dt)
+            + (h_post[..., None] * a[:, :, None, :]).astype(dt))
+
+
+@mx.compile
+def _attn_epilogue(o, gate, lam_logits, n_kv_heads, group, n_signal, v_dim):
+    B, H, L, _ = o.shape
+    o = o.transpose(0, 2, 1, 3).reshape(B, L, n_kv_heads, group, v_dim)
+    signal = o[..., : group - 1, :].reshape(B, L, n_signal, v_dim)
+    noise = mx.broadcast_to(
+        o[..., group - 1:, :], (B, L, n_kv_heads, group - 1, v_dim)
+    ).reshape(B, L, n_signal, v_dim)
+    lam = mx.sigmoid(lam_logits)
+    out = (signal - lam[..., None] * noise) * mx.sigmoid(gate)
+    return out.reshape(B, L, n_signal * v_dim)
+
+
 @mx.compile  # shapeless 불가(슬라이스 형상 추론) — 디코드 형상 소수라 형상-캐시로 충분
 def _gpoly_fused(x, w, b, sig, clamp, scale):
     a, t2, t1 = _poly_norm_terms(x)
@@ -293,6 +346,11 @@ class MoEGate(nn.Module):
         self.expert_bias = mx.zeros((args.num_experts,))
 
     def __call__(self, x):
+        if _COMPILE_GLUE:
+            return _gate_fused(
+                x @ self.weight.T, self.expert_bias,
+                self.top_k, self.route_norm, self.route_scale,
+            )
         scores = mx.sigmoid((x @ self.weight.T).astype(mx.float32))
         biased = scores + self.expert_bias.astype(mx.float32)
         inds = mx.argpartition(-biased, kth=self.top_k - 1, axis=-1)[..., : self.top_k]
@@ -317,6 +375,8 @@ class MotifMoE(nn.Module):
     def __call__(self, x):
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
+        if _COMPILE_GLUE:
+            return _moe_combine(y, scores, self.shared_experts(x))
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         return y + self.shared_experts(x)
 
@@ -407,6 +467,13 @@ class MHCLayer(nn.Module):
         hq = self.proj_post(xr).astype(mx.float32)
         if os.environ.get("MOTIF_SINKHORN_KERNEL", "1") == "1":
             hr = self.proj_res(xr).astype(mx.float32)
+            if _COMPILE_GLUE:
+                h_pre, h_post = _mhc_prepost(
+                    hp, hq, self.alpha_pre, self.bias_pre,
+                    self.alpha_post, self.bias_post, self.h_post_coeff,
+                )
+                m = _sinkhorn_kernel(self.alpha_res * hr + self.bias_res.reshape(E * E))
+                return h_pre, h_post, m
             h_pre = mx.sigmoid(mx.clip(self.alpha_pre * hp + self.bias_pre, -10.0, 10.0))
             h_post = mx.sigmoid(mx.clip(self.alpha_post * hq + self.bias_post, -10.0, 10.0))
             m = _sinkhorn_kernel(self.alpha_res * hr + self.bias_res.reshape(E * E))
@@ -649,6 +716,11 @@ class MotifAttention(nn.Module):
         )  # (B, n_heads, L, v_dim)
 
         # differential combine: group-major heads, noise head last in each group
+        if _COMPILE_GLUE:
+            return self.wo(_attn_epilogue(
+                o, gate, self.lambda_proj(x),
+                self.n_kv_heads, self.group, self.n_signal, self.v_dim,
+            ))
         o = o.transpose(0, 2, 1, 3).reshape(B, L, self.n_kv_heads, self.group, self.v_dim)
         signal = o[..., : self.group - 1, :].reshape(B, L, self.n_signal, self.v_dim)
         noise = mx.broadcast_to(
@@ -682,6 +754,14 @@ class MotifDecoderLayer(nn.Module):
         dt = x.dtype
 
         h_pre, h_post, h_res = self.mhc_attn(x)
+        if _COMPILE_GLUE:
+            xin = _mhc_premix(x, h_pre)
+            a = self.self_attn(self.input_layernorm(xin), mask, cache)
+            x = _mhc_postmix(h_res, x, h_post, a)
+            h_pre, h_post, h_res = self.mhc_ffn(x)
+            hin = _mhc_premix(x, h_pre)
+            f = self.mlp(self.post_attention_layernorm(hin))
+            return _mhc_postmix(h_res, x, h_post, f)
         xin = (x * h_pre[..., None]).sum(axis=2).astype(dt)
         a = self.self_attn(self.input_layernorm(xin), mask, cache)
         x = (
