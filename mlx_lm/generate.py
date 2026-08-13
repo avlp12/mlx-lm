@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -698,6 +699,7 @@ def mtp_speculative_generate_step(
     hybrid_lookup: bool = False,
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    spec_temp: float = 0.0,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
@@ -728,6 +730,14 @@ def mtp_speculative_generate_step(
             "nextn layer retained (num_nextn_predict_layers > 0)."
         )
     k_mtp = max(1, num_draft_tokens)
+    # spec_temp > 0: Leviathan rejection-sampling acceptance (accept draft x
+    # with prob min(1, p(x)/q(x)); on reject resample from (p-q)+). Exactly
+    # preserves the temp-T target distribution while accepting argmax-mismatched
+    # tokens the equality rule discards — vendor stacks (vLLM RejectionSampler)
+    # report 70-80% acceptance on the same head this way. spec_temp MUST match
+    # the sampler's temperature (top-p/top-k samplers are not supported here —
+    # leave spec_temp=0 for those). Killswitch: MLX_MTP_REJECTION=0.
+    rejection = spec_temp > 0.0 and os.environ.get("MLX_MTP_REJECTION", "1") != "0"
 
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
@@ -785,24 +795,50 @@ def mtp_speculative_generate_step(
             if cont:
                 _ = model.mtp_forward(h_anchor, t_next.reshape(1, 1), cache=mtp_cache)
                 drafts = [mx.array(c, dtype=mx.int64) for c in cont]
+        qls = []
+
+        def _draft_pick(lg):
+            if not rejection:
+                return mx.argmax(lg)
+            ql = (lg / spec_temp).astype(mx.float32)
+            ql = ql - mx.logsumexp(ql)
+            qls.append(ql)
+            return mx.random.categorical(ql)
+
         if drafts is None:
             drafts = []
             logits, g = model.mtp_forward(
                 h_anchor, t_next.reshape(1, 1), cache=mtp_cache, return_hidden=True
             )
-            drafts.append(mx.argmax(logits[0, -1]))
+            drafts.append(_draft_pick(logits[0, -1]))
             for _ in range(k_mtp - 1):
                 logits, g = model.mtp_forward(
                     model.mtp.shared_head(g), drafts[-1].reshape(1, 1),
                     cache=mtp_cache, return_hidden=True,
                 )
-                drafts.append(mx.argmax(logits[0, -1]))
+                drafts.append(_draft_pick(logits[0, -1]))
             chained = k_mtp - 1
         k = len(drafts)
         lg2 = model(mx.stack([t_next] + drafts).reshape(1, k + 1), cache=model_cache)
         h2 = model.model._h_prenorm
         lps = lg2[0] - mx.logsumexp(lg2[0], axis=-1, keepdims=True)
         trues = sampler(lps)
+        if qls:
+            # ai[j] = draft_j if accepted else residual resample. On rejection
+            # p(x)<q(x), so (p-q)+ has zero mass at x — the equality test in the
+            # main loop then reads acceptance for free from trues alone.
+            plp = (lg2[0, :k] / spec_temp).astype(mx.float32)
+            plp = plp - mx.logsumexp(plp, axis=-1, keepdims=True)
+            xs = mx.stack(drafts)
+            qlm = mx.stack(qls)
+            p_at = mx.take_along_axis(plp, xs[:, None], axis=-1).squeeze(-1)
+            q_at = mx.take_along_axis(qlm, xs[:, None], axis=-1).squeeze(-1)
+            accept = mx.log(mx.random.uniform(shape=(k,))) < (p_at - q_at)
+            resid = mx.maximum(mx.exp(plp) - mx.exp(qlm), 0.0)
+            res_tok = mx.random.categorical(mx.log(resid + 1e-30), axis=-1)
+            trues = mx.concatenate(
+                [mx.where(accept, xs, res_tok), trues[k:]], axis=0
+            )
         quantize_cache_fn(model_cache)
         mx.async_eval(trues, h2, *drafts)
         return drafts, chained, trues, lps, h2
