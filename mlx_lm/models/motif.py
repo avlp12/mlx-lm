@@ -86,6 +86,7 @@ class ModelArgs(BaseModelArgs):
     polynorm_sigmoid_weight: bool = True
     polynorm_output_scale: float = 0.5
     polynorm_bias_clamp: Optional[float] = 0.5
+    num_nextn_predict_layers: int = 0
     num_experts: int = 384
     experts_top_k: int = 8
     num_shared_experts: int = 1
@@ -696,7 +697,30 @@ class MotifModel(nn.Module):
         h = mx.broadcast_to(h[:, :, None, :], (B, L, self.args.mhc_expansion_rate, D))
         for layer, c in zip(self.layers, cache):
             h = layer(h, swa_mask if layer.self_attn.is_sliding else full_mask, c)
-        return self.norm(h.mean(axis=2))
+        hm = h.mean(axis=2)
+        self._h_prenorm = hm
+        self._h_4wide = h
+        return self.norm(hm)
+
+
+class MotifMtpModule(nn.Module):
+    """Motif-3 MTP(nextn) 블록([I186]): mHC 없는 플레인 잔차 블록 — GDLA(full-attn)
+    + PolyNorm MLP(inter 12288). 임베드/lm_head는 본체 공유, shared_head=final_layernorm."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        H = args.hidden_size
+        self.embed_norm = nn.RMSNorm(H, eps=args.rms_norm_eps)
+        self.input_proj = nn.Linear(2 * H, H, bias=False)
+        self.input_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
+        self.self_attn = MotifAttention(args, layer_idx=0)   # i=0 → full-attn(YaRN)
+        self.mlp = MotifMLP(args, intermediate_size=args.intermediate_size)
+        self.final_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
+
+    @property
+    def shared_head(self):
+        return self.final_layernorm
 
 
 class Model(nn.Module):
@@ -706,9 +730,34 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = MotifModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if getattr(args, "num_nextn_predict_layers", 0) > 0:
+            self.mtp = MotifMtpModule(args)
 
     def __call__(self, inputs, cache=None):
         return self.lm_head(self.model(inputs, cache))
+
+    @property
+    def has_mtp(self):
+        return hasattr(self, "mtp")
+
+    def make_mtp_cache(self):
+        return KVCache()
+
+    def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
+        """드래프트 로짓: 본체 pre-norm hidden h_prev(B,L,H) + 커밋 토큰(B,L).
+        체이닝은 NORMED hidden 재입력(mtp.shared_head(g)) — GLM 실측 교훈."""
+        emb = self.model.embed_tokens(tokens)
+        # 챔피언 배선([I186] 스윕 확정): [hidden ; embed_norm(embed)] — 역순은 수락 2%
+        x = self.mtp.input_proj(
+            mx.concatenate([h_prev.astype(emb.dtype), self.mtp.embed_norm(emb)], axis=-1)
+        )
+        mask = None
+        if x.shape[1] > 1:
+            mask = create_attention_mask(x, cache, return_array=True)
+        h1 = x + self.mtp.self_attn(self.mtp.input_layernorm(x), mask, cache)
+        h2 = h1 + self.mtp.mlp(self.mtp.post_attention_layernorm(h1))
+        logits = self.lm_head(self.mtp.shared_head(h2))
+        return (logits, h2) if return_hidden else logits
 
     def make_cache(self):
         # MOTIF_ROTATING_KV=0 forces plain KVCache on every layer (kv-probe /
