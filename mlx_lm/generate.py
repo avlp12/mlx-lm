@@ -891,6 +891,7 @@ def stream_generate(
     mtp: bool = False,
     mtp_num_draft_tokens: int = 2,
     mtp_hybrid: bool = False,
+    mtp_spec_temp: float = 0.0,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -948,6 +949,7 @@ def stream_generate(
             model,
             num_draft_tokens=mtp_num_draft_tokens,
             hybrid_lookup=mtp_hybrid,
+            spec_temp=mtp_spec_temp,
             **kwargs,
         )
     elif draft_model is None:
