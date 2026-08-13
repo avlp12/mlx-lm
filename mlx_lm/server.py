@@ -999,11 +999,13 @@ class ResponseGenerator:
                 mtp=use_mtp,
                 mtp_num_draft_tokens=getattr(self.cli_args, "mtp_num_draft_tokens", 2),
                 mtp_hybrid=getattr(self.cli_args, "mtp_hybrid", False),
-                # 순수-온도 샘플러일 때만 기각-샘플링 수락(분포 무손실, 수락률 ~2배).
-                # top-p/top-k/min-p/xtc가 걸리면 0(equality 폴백).
+                # 순수-온도 샘플러 + k=1일 때만 기각-샘플링 수락(분포 무손실).
+                # k≥2 체인은 샘플-드래프트가 앵커 품질을 훼손해 equality가 우세
+                # ([I198]); top-p/top-k/min-p/xtc가 걸리면 0(equality 폴백).
                 mtp_spec_temp=(
                     args.sampling.temperature
                     if use_mtp
+                    and getattr(self.cli_args, "mtp_num_draft_tokens", 2) == 1
                     and args.sampling.temperature > 0
                     and args.sampling.top_p >= 1.0
                     and args.sampling.top_k <= 0

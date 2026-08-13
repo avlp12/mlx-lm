@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 import functools
+import inspect
 import json
 import os
 import sys
@@ -738,6 +739,13 @@ def mtp_speculative_generate_step(
     # the sampler's temperature (top-p/top-k samplers are not supported here —
     # leave spec_temp=0 for those). Killswitch: MLX_MTP_REJECTION=0.
     rejection = spec_temp > 0.0 and os.environ.get("MLX_MTP_REJECTION", "1") != "0"
+    # 체인 재입력이 이미 final_layernorm을 통과한 모델(Motif)은 model.norm 재적용을
+    # 건너뛰어야 함(벤더 확정 배선). GLM 등 구계약 모델은 인자 미지원 → 무전달.
+    _chain_kwargs = (
+        {"pre_normed": True}
+        if "pre_normed" in inspect.signature(model.mtp_forward).parameters
+        else {}
+    )
 
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
@@ -814,7 +822,7 @@ def mtp_speculative_generate_step(
             for _ in range(k_mtp - 1):
                 logits, g = model.mtp_forward(
                     model.mtp.shared_head(g), drafts[-1].reshape(1, 1),
-                    cache=mtp_cache, return_hidden=True,
+                    cache=mtp_cache, return_hidden=True, **_chain_kwargs,
                 )
                 drafts.append(_draft_pick(logits[0, -1]))
             chained = k_mtp - 1

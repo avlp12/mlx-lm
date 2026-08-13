@@ -130,6 +130,33 @@ def _poly_norm_terms(x, eps=1e-6):
     return n(x * x2), n(x2), n(x)
 
 
+# PolyNorm은 비컴파일 시 호출당 ~12-14 elementwise/reduce 커널 발사(디스패치-폭탄
+# 클래스, Sinkhorn 교훈). shapeless-compile로 융합. 파이썬 스칼라 인자(sig/scale/
+# clamp)는 트레이스 상수로 접힘(값별 캐시). 킬스위치 MOTIF_COMPILE_ACT=0.
+_COMPILE_ACT = os.environ.get("MOTIF_COMPILE_ACT", "1") == "1"
+
+
+@partial(mx.compile, shapeless=True)
+def _poly_fused(x, w, b, sig, scale):
+    a, t2, t1 = _poly_norm_terms(x)
+    if sig:
+        w = mx.sigmoid(w)
+    y = w[0] * a + w[1] * t2 + w[2] * t1 + b
+    return y if scale == 1.0 else scale * y
+
+
+@mx.compile  # shapeless 불가(슬라이스 형상 추론) — 디코드 형상 소수라 형상-캐시로 충분
+def _gpoly_fused(x, w, b, sig, clamp, scale):
+    a, t2, t1 = _poly_norm_terms(x)
+    if sig:
+        w = mx.sigmoid(w)
+    if clamp is not None:
+        b = mx.clip(b, -clamp, clamp)
+    y = (w[..., 0:1, None] * a + w[..., 1:2, None] * t2
+         + w[..., 2:3, None] * t1 + b[..., None])
+    return y if scale == 1.0 else scale * y
+
+
 class PolyNorm(nn.Module):
     """Trainable polynomial-of-norms activation; weight [3], bias [1]."""
 
@@ -141,6 +168,10 @@ class PolyNorm(nn.Module):
         self.bias = mx.zeros((1,))
 
     def __call__(self, x):
+        if _COMPILE_ACT:
+            return _poly_fused(
+                x, self.weight, self.bias, self.sigmoid_weight, self.output_scale
+            )
         a, b, c = _poly_norm_terms(x)
         w = mx.sigmoid(self.weight) if self.sigmoid_weight else self.weight
         return self.output_scale * (w[0] * a + w[1] * b + w[2] * c + self.bias)
@@ -166,6 +197,11 @@ class GroupedPolyNorm(nn.Module):
     def __call__(self, x, indices):
         # x: (..., 1, I) rows aligned with indices (...,); both the sorted-flat
         # prefill path and the (B, L, K) decode path broadcast identically.
+        if _COMPILE_ACT:
+            return _gpoly_fused(
+                x, self.weight[indices], self.bias[indices],
+                self.sigmoid_weight, self.bias_clamp, self.output_scale,
+            )
         a, b, c = _poly_norm_terms(x)
         w = self.weight[indices]
         if self.sigmoid_weight:
@@ -743,12 +779,15 @@ class Model(nn.Module):
     def make_mtp_cache(self):
         return RotatingKVCache(max_size=self.model.window_size, keep=0)
 
-    def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
+    def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False,
+                    pre_normed=False):
         """드래프트 로짓: 본체 pre-norm hidden h_prev(B,L,H) + 커밋 토큰(B,L).
-        체이닝은 NORMED hidden 재입력(mtp.shared_head(g)) — GLM 실측 교훈."""
+        체이닝은 mtp.shared_head(g)=final_layernorm 출력을 pre_normed=True로 직결
+        (벤더 확정: 체인에 model.norm 재적용 없음 — motif_mtp.py L164)."""
         emb = self.model.embed_tokens(tokens)
         # 벤더 확정 배선([I188] 훈련코드): [POST-norm hidden ; embed_norm(embed)], (h_i, t_{i+1})
-        hn = self.model.norm(h_prev.astype(emb.dtype))
+        h_ = h_prev.astype(emb.dtype)
+        hn = h_ if pre_normed else self.model.norm(h_)
         x = self.mtp.input_proj(mx.concatenate([hn, self.mtp.embed_norm(emb)], axis=-1))
         mask = None
         if x.shape[1] > 1:
