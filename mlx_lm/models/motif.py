@@ -714,7 +714,7 @@ class MotifMtpModule(nn.Module):
         self.input_proj = nn.Linear(2 * H, H, bias=False)
         self.input_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
-        self.self_attn = MotifAttention(args, layer_idx=0)   # i=0 → full-attn(YaRN)
+        self.self_attn = MotifAttention(args, layer_idx=1)   # 벤더: MTP층=SWA(53%4=1, 창129·swa_theta)
         self.mlp = MotifMLP(args, intermediate_size=args.intermediate_size)
         self.final_layernorm = nn.RMSNorm(H, eps=args.rms_norm_eps)
 
@@ -741,16 +741,15 @@ class Model(nn.Module):
         return hasattr(self, "mtp")
 
     def make_mtp_cache(self):
-        return KVCache()
+        return RotatingKVCache(max_size=self.model.window_size, keep=0)
 
     def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
         """드래프트 로짓: 본체 pre-norm hidden h_prev(B,L,H) + 커밋 토큰(B,L).
         체이닝은 NORMED hidden 재입력(mtp.shared_head(g)) — GLM 실측 교훈."""
         emb = self.model.embed_tokens(tokens)
-        # 챔피언 배선([I186] 스윕 확정): [hidden ; embed_norm(embed)] — 역순은 수락 2%
-        x = self.mtp.input_proj(
-            mx.concatenate([h_prev.astype(emb.dtype), self.mtp.embed_norm(emb)], axis=-1)
-        )
+        # 벤더 확정 배선([I188] 훈련코드): [POST-norm hidden ; embed_norm(embed)], (h_i, t_{i+1})
+        hn = self.model.norm(h_prev.astype(emb.dtype))
+        x = self.mtp.input_proj(mx.concatenate([hn, self.mtp.embed_norm(emb)], axis=-1))
         mask = None
         if x.shape[1] > 1:
             mask = create_attention_mask(x, cache, return_array=True)
