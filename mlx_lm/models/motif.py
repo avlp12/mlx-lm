@@ -149,6 +149,160 @@ def _poly_fused(x, w, b, sig, scale):
 # 킬스위치 MOTIF_COMPILE_GLUE=0. 형상-캐시 컴파일(디코드 형상 소수).
 _COMPILE_GLUE = os.environ.get("MOTIF_COMPILE_GLUE", "1") == "1"
 
+# mHC-천이 메가커널([I205]): rmsnorm(16K)→proj24→gates→Sinkhorn20→premix→input_ln
+# 직렬 ~7단계를 위치당 1 threadgroup 단일 커널로(천이당 −50%, L=4 174.6→83.6µs).
+# 소형-텐서 부기만 포함(v1 실패 원인이던 대형 GEMM 없음), fp32 내부 연산.
+# 디코드/verify 전용(L≤8) — 프리필은 TG당 가중치 재판독 비용 때문에 레거시 경로.
+# 킬스위치 MOTIF_MHC_TRANS=0.
+_MHC_TRANS = os.environ.get("MOTIF_MHC_TRANS", "1") == "1"
+
+_MHC_TRANS_SRC = """
+    const int TGT = 1024;
+    uint tid = thread_position_in_threadgroup.x;
+    uint pos = threadgroup_position_in_grid.x;
+    uint lane = tid & 31;
+    uint sg = tid >> 5;
+    const int ED = 16384;
+    const int D = 4096;
+
+    const device bfloat16_t* xp = x + (size_t)pos * ED;
+
+    threadgroup float ssbuf[32];
+    threadgroup float pbuf[24 * 32];
+    threadgroup float gate[24];
+    threadgroup float mm[16];
+    threadgroup float hpre[4];
+    threadgroup float xin[4096];
+
+    float ss = 0.0f;
+    for (int i = tid; i < ED; i += TGT) {
+        float v = (float)xp[i];
+        ss += v * v;
+    }
+    ss = metal::simd_sum(ss);
+    if (lane == 0) ssbuf[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        float t = ssbuf[tid];
+        t = metal::simd_sum(t);
+        if (tid == 0) ssbuf[0] = metal::rsqrt(t / (float)ED + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms1 = ssbuf[0];
+
+    float acc[24];
+    for (int j = 0; j < 24; ++j) acc[j] = 0.0f;
+    for (int i = tid; i < ED; i += TGT) {
+        float xv = (float)xp[i] * rms1 * (float)wn[i];
+        for (int j = 0; j < 24; ++j)
+            acc[j] += xv * (float)pw[(size_t)j * ED + i];
+    }
+    for (int j = 0; j < 24; ++j) {
+        float a = metal::simd_sum(acc[j]);
+        if (lane == 0) pbuf[j * 32 + sg] = a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 24) {
+        float t = 0.0f;
+        for (int s = 0; s < 32; ++s) t += pbuf[tid * 32 + s];
+        if (tid < 4)
+            gate[tid] = 1.0f / (1.0f + metal::exp(-metal::clamp(
+                a_pre[0] * t + b_pre[tid], -10.0f, 10.0f)));
+        else if (tid < 8)
+            gate[tid] = hpc[0] / (1.0f + metal::exp(-metal::clamp(
+                a_post[0] * t + b_post[tid - 4], -10.0f, 10.0f)));
+        else
+            gate[tid] = metal::exp(metal::clamp(
+                a_res[0] * t + b_res[tid - 8], -20.0f, 20.0f));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float m[16];
+        for (int i = 0; i < 16; ++i) m[i] = gate[8 + i];
+        for (int it = 0; it < 20; ++it) {
+            for (int r = 0; r < 4; ++r) {
+                float s = m[r*4] + m[r*4+1] + m[r*4+2] + m[r*4+3];
+                s = metal::max(s, 1e-8f);
+                for (int c = 0; c < 4; ++c) m[r*4+c] /= s;
+            }
+            for (int c = 0; c < 4; ++c) {
+                float s = m[c] + m[4+c] + m[8+c] + m[12+c];
+                s = metal::max(s, 1e-8f);
+                for (int r = 0; r < 4; ++r) m[r*4+c] /= s;
+            }
+        }
+        for (int i = 0; i < 16; ++i) mm[i] = m[i];
+        for (int e = 0; e < 4; ++e) hpre[e] = gate[e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float h0 = hpre[0], h1 = hpre[1], h2 = hpre[2], h3 = hpre[3];
+    float ss2 = 0.0f;
+    for (int d = tid; d < D; d += TGT) {
+        float v = h0 * (float)xp[d] + h1 * (float)xp[D + d]
+                + h2 * (float)xp[2*D + d] + h3 * (float)xp[3*D + d];
+        xin[d] = v;
+        ss2 += v * v;
+    }
+    ss2 = metal::simd_sum(ss2);
+    if (lane == 0) ssbuf[sg] = ss2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        float t = ssbuf[tid];
+        t = metal::simd_sum(t);
+        if (tid == 0) ssbuf[0] = metal::rsqrt(t / (float)D + ln_eps[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms2 = ssbuf[0];
+
+    device bfloat16_t* op = out_x + (size_t)pos * D;
+    for (int d = tid; d < D; d += TGT)
+        op[d] = (bfloat16_t)(xin[d] * rms2 * (float)g2[d]);
+    if (tid < 4) out_hpost[pos * 4 + tid] = gate[4 + tid];
+    if (tid < 16) out_m[pos * 16 + tid] = mm[tid];
+"""
+
+_mhc_trans_kernel = mx.fast.metal_kernel(
+    name="mhc_transition",
+    input_names=["x", "wn", "pw", "a_pre", "b_pre", "a_post", "b_post",
+                 "a_res", "b_res", "hpc", "g2", "ln_eps"],
+    output_names=["out_x", "out_hpost", "out_m"],
+    source=_MHC_TRANS_SRC,
+)
+
+
+# 커널 상수 캐시 — nn.Module 속성으로 넣으면 파라미터로 등록되므로 별도 dict.
+_MHC_TRANS_CACHE = {}
+
+
+def _mhc_transition(x, mhc, ln):
+    """x (1,L,4,4096) → (정규화 xin (1,L,4096), h_post (1,L,4), m (1,L,4,4))."""
+    B, L, E, D = x.shape
+    key = id(mhc)
+    ent = _MHC_TRANS_CACHE.get(key)
+    if ent is None:
+        pw = mx.concatenate(
+            [mhc.proj_pre.weight, mhc.proj_post.weight, mhc.proj_res.weight],
+            axis=0,
+        ).astype(mx.bfloat16)
+        hpc = mx.array([mhc.h_post_coeff], dtype=mx.float32)
+        eps = mx.array([ln.eps], dtype=mx.float32)
+        ent = (pw, hpc, eps)
+        _MHC_TRANS_CACHE[key] = ent
+    pw, hpc, eps = ent
+    xn, hpost, m = _mhc_trans_kernel(
+        inputs=[x.reshape(L, E * D), mhc.rms_norm.weight, pw,
+                mhc.alpha_pre, mhc.bias_pre, mhc.alpha_post, mhc.bias_post,
+                mhc.alpha_res, mhc.bias_res.reshape(E * E), hpc,
+                ln.weight, eps],
+        output_shapes=[(L, D), (L, 4), (L, 16)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+        grid=(L * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+    )
+    return xn.reshape(B, L, D), hpost.reshape(B, L, 4), m.reshape(B, L, 4, 4)
+
 
 @mx.compile
 def _gate_fused(logits, expert_bias, top_k, route_norm, route_scale):
@@ -752,6 +906,16 @@ class MotifDecoderLayer(nn.Module):
     def __call__(self, x, mask=None, cache=None):
         # x: (B, L, E, D) — the 4-wide mHC residual stream
         dt = x.dtype
+
+        if (_MHC_TRANS and x.shape[0] == 1 and x.shape[1] <= 8
+                and x.shape[2] == 4 and x.shape[3] == 4096
+                and os.environ.get("MOTIF_SINKHORN_KERNEL", "1") == "1"):
+            xin_n, h_post, m = _mhc_transition(x, self.mhc_attn, self.input_layernorm)
+            a = self.self_attn(xin_n, mask, cache)
+            x = _mhc_postmix(m, x, h_post, a)
+            hin_n, h_post, m = _mhc_transition(x, self.mhc_ffn, self.post_attention_layernorm)
+            f = self.mlp(hin_n)
+            return _mhc_postmix(m, x, h_post, f)
 
         h_pre, h_post, h_res = self.mhc_attn(x)
         if _COMPILE_GLUE:
