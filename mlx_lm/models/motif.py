@@ -165,7 +165,30 @@ _MHC_TRANS_SRC = """
     const int ED = 16384;
     const int D = 4096;
 
-    const device bfloat16_t* xp = x + (size_t)pos * ED;
+    // fuse_post[0]==1이면 x는 postmix 이전 상태 — 커널이 먼저
+    // x' = m_prev @ x + h_post_prev * a 를 out_xres(디바이스)에 쓰고 그걸로 진행.
+    // (threadgroup 32KB 한도 때문에 x' fp32 캐시는 불가 — 디바이스 왕복, bf16
+    //  라운딩은 기존 compiled postmix의 astype과 동일 의미론)
+    const device bfloat16_t* xp0 = x + (size_t)pos * ED;
+    device bfloat16_t* xo = out_xres + (size_t)pos * ED;
+    if (fuse_post[0] == 1) {
+        float mp[16];
+        for (int i = 0; i < 16; ++i) mp[i] = m_prev[pos * 16 + i];
+        float hp0 = hpost_prev[pos*4], hp1 = hpost_prev[pos*4+1],
+              hp2 = hpost_prev[pos*4+2], hp3 = hpost_prev[pos*4+3];
+        const device bfloat16_t* ap = a_in + (size_t)pos * D;
+        for (int d = tid; d < D; d += TGT) {
+            float x0 = (float)xp0[d],       x1 = (float)xp0[D + d],
+                  x2 = (float)xp0[2*D + d], x3 = (float)xp0[3*D + d];
+            float av = (float)ap[d];
+            xo[d]       = (bfloat16_t)(mp[0]*x0 + mp[1]*x1 + mp[2]*x2 + mp[3]*x3 + hp0*av);
+            xo[D + d]   = (bfloat16_t)(mp[4]*x0 + mp[5]*x1 + mp[6]*x2 + mp[7]*x3 + hp1*av);
+            xo[2*D + d] = (bfloat16_t)(mp[8]*x0 + mp[9]*x1 + mp[10]*x2 + mp[11]*x3 + hp2*av);
+            xo[3*D + d] = (bfloat16_t)(mp[12]*x0 + mp[13]*x1 + mp[14]*x2 + mp[15]*x3 + hp3*av);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    const device bfloat16_t* xp = (fuse_post[0] == 1) ? xo : xp0;
 
     threadgroup float ssbuf[32];
     threadgroup float pbuf[24 * 32];
@@ -266,18 +289,34 @@ _MHC_TRANS_SRC = """
 _mhc_trans_kernel = mx.fast.metal_kernel(
     name="mhc_transition",
     input_names=["x", "wn", "pw", "a_pre", "b_pre", "a_post", "b_post",
-                 "a_res", "b_res", "hpc", "g2", "ln_eps"],
-    output_names=["out_x", "out_hpost", "out_m"],
+                 "a_res", "b_res", "hpc", "g2", "ln_eps",
+                 "fuse_post", "m_prev", "hpost_prev", "a_in"],
+    output_names=["out_x", "out_hpost", "out_m", "out_xres"],
     source=_MHC_TRANS_SRC,
 )
+
+_FUSE0 = None
+_FUSE1 = None
+_DUMMY = None
+
+
+def _fuse_consts():
+    global _FUSE0, _FUSE1, _DUMMY
+    if _FUSE0 is None:
+        _FUSE0 = mx.array([0], dtype=mx.int32)
+        _FUSE1 = mx.array([1], dtype=mx.int32)
+        _DUMMY = mx.zeros((1,), dtype=mx.float32)
+    return _FUSE0, _FUSE1, _DUMMY
 
 
 # 커널 상수 캐시 — nn.Module 속성으로 넣으면 파라미터로 등록되므로 별도 dict.
 _MHC_TRANS_CACHE = {}
 
 
-def _mhc_transition(x, mhc, ln):
-    """x (1,L,4,4096) → (정규화 xin (1,L,4096), h_post (1,L,4), m (1,L,4,4))."""
+def _mhc_transition(x, mhc, ln, a_post_in=None, hp_prev_in=None, m_prev_in=None):
+    """x (1,L,4,4096) → (정규화 xin, h_post, m, x_res).
+    a_post_in이 주어지면 직전 postmix(x' = m_prev@x + h_post_prev·a)를 커널
+    안에서 선-수행하고 x_res로 갱신 잔차를 반환(층내 폴딩, [I206])."""
     B, L, E, D = x.shape
     key = id(mhc)
     ent = _MHC_TRANS_CACHE.get(key)
@@ -291,17 +330,26 @@ def _mhc_transition(x, mhc, ln):
         ent = (pw, hpc, eps)
         _MHC_TRANS_CACHE[key] = ent
     pw, hpc, eps = ent
-    xn, hpost, m = _mhc_trans_kernel(
+    f0, f1, dm = _fuse_consts()
+    if a_post_in is None:
+        fuse, m_prev, hp_prev, a_in = f0, dm, dm, x.reshape(L, E * D)
+    else:
+        fuse = f1
+        m_prev = m_prev_in.astype(mx.float32).reshape(L, 16)
+        hp_prev = hp_prev_in.astype(mx.float32).reshape(L, 4)
+        a_in = a_post_in.reshape(L, D)
+    xn, hpost, m, xres = _mhc_trans_kernel(
         inputs=[x.reshape(L, E * D), mhc.rms_norm.weight, pw,
                 mhc.alpha_pre, mhc.bias_pre, mhc.alpha_post, mhc.bias_post,
                 mhc.alpha_res, mhc.bias_res.reshape(E * E), hpc,
-                ln.weight, eps],
-        output_shapes=[(L, D), (L, 4), (L, 16)],
-        output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+                ln.weight, eps, fuse, m_prev, hp_prev, a_in],
+        output_shapes=[(L, D), (L, 4), (L, 16), (L, E * D)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.float32, mx.bfloat16],
         grid=(L * 1024, 1, 1),
         threadgroup=(1024, 1, 1),
     )
-    return xn.reshape(B, L, D), hpost.reshape(B, L, 4), m.reshape(B, L, 4, 4)
+    return (xn.reshape(B, L, D), hpost.reshape(B, L, 4),
+            m.reshape(B, L, 4, 4), xres.reshape(B, L, E, D))
 
 
 @mx.compile
@@ -910,10 +958,16 @@ class MotifDecoderLayer(nn.Module):
         if (_MHC_TRANS and x.shape[0] == 1 and x.shape[1] <= 8
                 and x.shape[2] == 4 and x.shape[3] == 4096
                 and os.environ.get("MOTIF_SINKHORN_KERNEL", "1") == "1"):
-            xin_n, h_post, m = _mhc_transition(x, self.mhc_attn, self.input_layernorm)
+            # postmix-폴딩(a_post_in 경로)은 e2e 중립으로 기각([I206]) — 폴딩된
+            # postmix가 TG당 직렬이라 다중-TG compiled postmix 대비 이득 상쇄.
+            xin_n, h_post, m, _ = _mhc_transition(
+                x, self.mhc_attn, self.input_layernorm
+            )
             a = self.self_attn(xin_n, mask, cache)
             x = _mhc_postmix(m, x, h_post, a)
-            hin_n, h_post, m = _mhc_transition(x, self.mhc_ffn, self.post_attention_layernorm)
+            hin_n, h_post, m, _ = _mhc_transition(
+                x, self.mhc_ffn, self.post_attention_layernorm
+            )
             f = self.mlp(hin_n)
             return _mhc_postmix(m, x, h_post, f)
 
