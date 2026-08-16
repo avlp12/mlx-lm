@@ -161,13 +161,33 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
 
 
 _ORIGINAL_CALL = None
+_ORIGINAL_SHARDED_CALLS: dict = {}
+
+
+def _qmm_or_fallback(self, x, original):
+    """affine 창이면 fast_qmm, 아니면 원본 GEMM 경로만 (통신 없이)."""
+    if "biases" not in self or getattr(self, "mode", "affine") != "affine":
+        return None  # 호출자가 원본 __call__ 전체로 폴백
+    return fast_qmm(
+        x,
+        self["weight"],
+        self["scales"],
+        self["biases"],
+        group_size=self.group_size,
+        bits=self.bits,
+    )
 
 
 def enable(model: Any = None) -> None:
-    """Route `nn.QuantizedLinear` through `fast_qmm`.
+    """Route quantized linears through `fast_qmm`.
 
     Patching the class rather than each instance keeps this reversible and keeps
     quantized layers created later (draft models, adapters) on the same path.
+    The TP sharded variants (`Quantized{AllToSharded,ShardedToAll}Linear`) are
+    NOT subclasses of `nn.QuantizedLinear`, so they are patched separately with
+    their communication step (sum_gradients / all_sum) preserved verbatim —
+    without this, tensor-parallel runs silently fall back to the small-M slope
+    the kernel exists to fix.
     Set `MLXLM_NO_FAST_QMM=1` to opt out without touching call sites.
     """
     global _ORIGINAL_CALL
@@ -178,21 +198,53 @@ def enable(model: Any = None) -> None:
     def __call__(self, x):
         # 커널은 affine(scales+biases) 전용 — nvfp4/mxfp4 등 다른 모드의 층은
         # biases 가 없어 KeyError 로 죽는다(community 빌드 KL 측정에서 실증).
-        if "biases" not in self or getattr(self, "mode", "affine") != "affine":
+        y = _qmm_or_fallback(self, x, _ORIGINAL_CALL)
+        if y is None:
             return _ORIGINAL_CALL(self, x)
-        y = fast_qmm(
-            x,
-            self["weight"],
-            self["scales"],
-            self["biases"],
-            group_size=self.group_size,
-            bits=self.bits,
-        )
         if "bias" in self:
             y = y + self["bias"]
         return y
 
     nn.QuantizedLinear.__call__ = __call__
+
+    try:
+        from mlx.nn.layers.distributed import (
+            QuantizedAllToShardedLinear,
+            QuantizedShardedToAllLinear,
+            sum_gradients,
+        )
+    except ImportError:
+        return
+
+    _ORIGINAL_SHARDED_CALLS[QuantizedAllToShardedLinear] = (
+        QuantizedAllToShardedLinear.__call__
+    )
+    _ORIGINAL_SHARDED_CALLS[QuantizedShardedToAllLinear] = (
+        QuantizedShardedToAllLinear.__call__
+    )
+
+    def __call_a2s__(self, x):
+        orig = _ORIGINAL_SHARDED_CALLS[QuantizedAllToShardedLinear]
+        x = sum_gradients(self.group)(x)
+        y = _qmm_or_fallback(self, x, orig)
+        if y is None:
+            return orig(self, x)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+
+    def __call_s2a__(self, x):
+        orig = _ORIGINAL_SHARDED_CALLS[QuantizedShardedToAllLinear]
+        y = _qmm_or_fallback(self, x, orig)
+        if y is None:
+            return orig(self, x)
+        y = mx.distributed.all_sum(y, group=self.group)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+
+    QuantizedAllToShardedLinear.__call__ = __call_a2s__
+    QuantizedShardedToAllLinear.__call__ = __call_s2a__
 
 
 def disable() -> None:
@@ -200,3 +252,6 @@ def disable() -> None:
     if _ORIGINAL_CALL is not None:
         nn.QuantizedLinear.__call__ = _ORIGINAL_CALL
         _ORIGINAL_CALL = None
+    for cls, call in _ORIGINAL_SHARDED_CALLS.items():
+        cls.__call__ = call
+    _ORIGINAL_SHARDED_CALLS.clear()
