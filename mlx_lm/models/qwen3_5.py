@@ -9,18 +9,201 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
-from .qwen3_next import Qwen3NextAttention as Attention
-from .qwen3_next import Qwen3NextMLP as MLP
+from .qwen3_next import Qwen3NextAttention as _Qwen3NextAttention
+from .qwen3_next import Qwen3NextMLP as _Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+
+# ── 글루-융합 1단계 (~/qwen38/glue_fusion_plan.md §2.1) ──────────────────────
+# 디코드 스텝은 대역폭 바닥(21.7ms) 위에 ~1600개 launch 의 직렬 디스패치 갭이
+# 얹힌 구조라, 소형-텐서 부기를 연접·컴파일로 줄이는 것이 유일한 회수 수단이다.
+# 대형 GEMM 은 절대 융합체 안에 넣지 않는다([I49]/[I51]: MLP GEMM 은 이미 대역폭
+# 상한. Motif v1 메가커널 침몰 원인).
+#
+# 킬스위치는 import 시 1회 판독(Motif 관례). A/B 는 반드시 **별도 프로세스** —
+# 같은 프로세스 토글은 compile 캐시·fast_qmm 클래스 패치 잔존으로 무효(§5-R2).
+#   QWEN35_FUSED_PROJ=0   … §2.1(a) 가중치-연접(GDN in_proj 4→1, ATTN qkv 3→1,
+#                          MLP gate/up 2→1) 비활성. launch −240/스텝, S=1~4 비트 동일.
+#   QWEN35_COMPILE_GLUE=0 … §2.1(b) 중 생존 항목 = q/k 스칼라 접기(launch −96/스텝,
+#                          비트 동일 실측 — fast.rms_norm 이 정규화값을 출력 dtype 으로
+#                          라운딩한 뒤 weight 를 곱해 eager 이중-라운딩과 일치).
+#
+# §2.1(b)의 βg 융합·ATTN 에필로그는 **실측 no-op 으로 판명되어 제거**(2026-08-16
+# census): mx.compile 은 연결되지 않은 출력(sigmoid(b) ↔ g-사슬)을 한 커널로
+# 묶지 않고, compute 연산이 1개뿐인 서브그래프(transpose/reshape+mul)는 융합
+# 커널 없이 원 프리미티브로 방출한다. exp5_fusion 원장 [J#] 참조.
+_FUSED_PROJ = os.environ.get("QWEN35_FUSED_PROJ", "0") == "1"
+_COMPILE_GLUE = os.environ.get("QWEN35_COMPILE_GLUE", "0") == "1"
+
+
+class _ConcatQuantizedLinear(nn.QuantizedLinear):
+    """N-축으로 연접한 QuantizedLinear.
+
+    반드시 nn.QuantizedLinear 의 서브클래스여야 한다: fast_qmm.enable() 이
+    `nn.QuantizedLinear.__call__` 을 클래스 패치하므로, __call__ 을 정의하지
+    않는 서브클래스는 검증 폭 6~8 의 split-K 커널을 자동으로 탄다(§5-R2).
+    4bit/g64 affine 의 양자화 파라미터(scales/biases)는 출력-행 단위라 N-축
+    연접은 행별 연산을 바꾸지 않는다 — 수치 항등(오라클 T1 로 확인).
+    인스턴스는 `_concat_quantized` 로만 만든다.
+    """
+
+
+def _concat_quantized(mods):
+    """같은 입력을 받는 QuantizedLinear 들을 N-축 연접한 모듈로. 부적격이면 None.
+
+    엄격한 타입 검사(서브클래스 불허)로 샤딩 래퍼(Quantized*ShardedLinear)를
+    걸러낸다 — TP 경로는 레거시 유지(§5-R8).
+    """
+    if not all(type(m) is nn.QuantizedLinear for m in mods):
+        return None
+    m0 = mods[0]
+    for m in mods:
+        if (
+            "bias" in m
+            or m.get("biases") is None
+            or m.group_size != m0.group_size
+            or m.bits != m0.bits
+            or m.mode != m0.mode
+        ):
+            return None
+    out = _ConcatQuantizedLinear.__new__(_ConcatQuantizedLinear)
+    nn.Module.__init__(out)
+    out.group_size, out.bits, out.mode = m0.group_size, m0.bits, m0.mode
+    out.weight = mx.concatenate([m["weight"] for m in mods], axis=0)
+    out.scales = mx.concatenate([m["scales"] for m in mods], axis=0)
+    out.biases = mx.concatenate([m["biases"] for m in mods], axis=0)
+    mx.eval(out.weight, out.scales, out.biases)
+    out.freeze()
+    return out
+
+
+def _alias_rows(fused, mods):
+    """원본 모듈들의 어레이를 연접 버퍼의 행-슬라이스 뷰로 교체한다.
+
+    연접 직후 원본 버퍼가 해제되므로 순 메모리 증가가 0 이고, 레거시 경로
+    (프리필 S>8, 킬스위치 밖 형상)는 뷰 위에서 비트 동일하게 동작한다
+    (행-슬라이스는 연속 뷰 — 같은 값·같은 레이아웃·같은 커널).
+    """
+    o = 0
+    for m in mods:
+        n = m["weight"].shape[0]
+        m.weight = fused["weight"][o : o + n]
+        m.scales = fused["scales"][o : o + n]
+        m.biases = fused["biases"][o : o + n]
+        o += n
+
+
+class Attention(_Qwen3NextAttention):
+    """qwen3_5 전용 확장: §2.1(a) qkv 연접(3→1 GEMM).
+
+    게이트 밖(프리필 L>8, 배치 B>1, 샤딩, 훈련)은 부모 경로 그대로 —
+    MTP 블록도 이 클래스를 재사용하므로 융합이 자동 적용된다(§3 오라클 포함).
+    (§2.1b 의 compile 에필로그는 실측 no-op 으로 제거 — 모듈 헤더 주석 참조.)
+    """
+
+    def __init__(self, args):
+        super().__init__(args)
+        self._fused_qkv = None
+        self._fused_tried = False
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        in_window = (
+            B == 1
+            and L <= 8
+            and not self.training
+            and (cache is None or getattr(cache, "lengths", None) is None)
+        )
+        if not (_FUSED_PROJ and in_window):
+            return super().__call__(x, mask, cache)
+
+        if self._fused_qkv is None and not self._fused_tried:
+            self._fused_tried = True
+            mods = [self.q_proj, self.k_proj, self.v_proj]
+            self._fused_qkv = _concat_quantized(mods)
+            if self._fused_qkv is not None:
+                _alias_rows(self._fused_qkv, mods)
+        if self._fused_qkv is None:
+            return super().__call__(x, mask, cache)
+        nq = self.num_attention_heads * self.head_dim * 2
+        nkv = self.num_key_value_heads * self.head_dim
+        qkv = self._fused_qkv(x)
+        q_proj_output = qkv[..., :nq]
+        keys = qkv[..., nq : nq + nkv]
+        values = qkv[..., nq + nkv :]
+
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        gate = gate.reshape(B, L, -1)
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
+
+
+class MLP(_Qwen3NextMLP):
+    """qwen3_5 전용 확장: §2.1(a) gate/up 연접(2→1 GEMM). swiglu 는 기존
+    shapeless-compile 그대로."""
+
+    def __init__(self, dim, hidden_dim):
+        super().__init__(dim, hidden_dim)
+        self._hidden_dim = hidden_dim
+        self._fused_gateup = None
+        self._fused_tried = False
+
+    def __call__(self, x) -> mx.array:
+        if not (
+            _FUSED_PROJ
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] <= 8
+            and not self.training
+        ):
+            return super().__call__(x)
+        if self._fused_gateup is None and not self._fused_tried:
+            self._fused_tried = True
+            mods = [self.gate_proj, self.up_proj]
+            self._fused_gateup = _concat_quantized(mods)
+            if self._fused_gateup is not None:
+                _alias_rows(self._fused_gateup, mods)
+        if self._fused_gateup is None:
+            return super().__call__(x)
+        gu = self._fused_gateup(x)
+        h = self._hidden_dim
+        return self.down_proj(swiglu(gu[..., :h], gu[..., h:]))
 
 
 @dataclass
@@ -131,6 +314,11 @@ class GatedDeltaNet(nn.Module):
 
         self.sharding_group = None
 
+        # 글루-융합 상태(§2.1) — 밑줄 접두라 파라미터 트리 밖(저장/양자화 불가시).
+        self._fused_in_proj = None
+        self._fused_tried = False
+        self._fold_w = None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -154,10 +342,38 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        # §2.1 융합 게이트: 디코드/검증 폭 전용. 프리필(S>8)·배치·샤딩·훈련·
+        # ragged(lengths) 는 레거시 경로(§5-R3/R7/R8).
+        in_window = (
+            B == 1
+            and S <= 8
+            and self.sharding_group is None
+            and not self.training
+            and (cache is None or cache.lengths is None)
+        )
+        fused_ok = _FUSED_PROJ and in_window
+        glue_ok = _COMPILE_GLUE and in_window
+
+        if fused_ok and self._fused_in_proj is None and not self._fused_tried:
+            self._fused_tried = True
+            mods = [self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a]
+            self._fused_in_proj = _concat_quantized(mods)
+            if self._fused_in_proj is not None:
+                _alias_rows(self._fused_in_proj, mods)
+        if fused_ok and self._fused_in_proj is not None:
+            # 4 qmm → 1 qmm(N=16480). N=48 GEMV 2개(그리드 미달, 지연-바운드)가
+            # 대형 GEMV 패스에 흡수된다. S=1 에서 슬라이스는 전부 연속-오프셋 뷰.
+            cd, vd, nh = self.conv_dim, self.value_dim, self.num_v_heads
+            proj = self._fused_in_proj(inputs)
+            qkv = proj[..., :cd]
+            z = proj[..., cd : cd + vd].reshape(B, S, nh, self.head_v_dim)
+            b = proj[..., cd + vd : cd + vd + nh]
+            a = proj[..., cd + vd + nh :]
+        else:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -191,8 +407,22 @@ class GatedDeltaNet(nn.Module):
 
         state = cache[1] if cache else None
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        if glue_ok:
+            # 스칼라곱을 rms_norm 의 weight 벡터로 접는다 — launch −2/층.
+            # 비트 동일 실측(오라클 T1): fast.rms_norm 은 정규화값을 출력 dtype 으로
+            # 라운딩한 뒤 weight 를 곱하므로 eager 의 이중-라운딩과 일치하고,
+            # 스칼라의 bf16 캐스트도 eager 의 weak-promotion 과 같다.
+            if self._fold_w is None:
+                self._fold_w = (
+                    mx.full((self.head_k_dim,), inv_scale**2, dtype=q.dtype),
+                    mx.full((self.head_k_dim,), inv_scale, dtype=k.dtype),
+                )
+                mx.eval(self._fold_w)
+            q = mx.fast.rms_norm(q, self._fold_w[0], 1e-6)
+            k = mx.fast.rms_norm(k, self._fold_w[1], 1e-6)
+        else:
+            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         out, state = gated_delta_update(
             q,
