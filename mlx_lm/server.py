@@ -298,6 +298,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.prefill_2box = None
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -374,6 +375,52 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+
+        # Opt-in two-box prefill: bound to the startup model, plain decode
+        # only, sequential serving (no batching).
+        p2b = getattr(self.cli_args, "prefill_2box", None)
+        if self.prefill_2box is not None:
+            self.prefill_2box.close()
+            self.prefill_2box = None
+        if p2b:
+            if draft_model is not None:
+                raise ValueError(
+                    "--prefill-2box is plain-decode only (v1): it cannot be "
+                    "combined with a draft model."
+                )
+            if adapter_path is not None:
+                raise ValueError(
+                    "--prefill-2box cannot be combined with adapters: the "
+                    "remote runner serves the base model's layers [0, split)."
+                )
+            if self.is_distributed:
+                raise ValueError(
+                    "--prefill-2box cannot be combined with distributed serving."
+                )
+            if model_path != self._model_map["default_model"]:
+                raise ValueError(
+                    "--prefill-2box is bound to the startup --model; "
+                    f"switching to {model_path!r} is not supported."
+                )
+            from .prefill_2box.serving import ServingPrefill, parse_hostport
+
+            host, port = parse_hostport(p2b)
+            self.prefill_2box = ServingPrefill(
+                model,
+                host,
+                port,
+                split=self.cli_args.prefill_2box_split,
+                chunk=self.cli_args.prefill_2box_chunk,
+                min_tokens=self.cli_args.prefill_2box_min_tokens,
+            )
+            logging.info(
+                f"[prefill_2box] connected to {host}:{port} "
+                f"(split {self.cli_args.prefill_2box_split}, "
+                f"chunk {self.cli_args.prefill_2box_chunk}, "
+                f"min_tokens {self.cli_args.prefill_2box_min_tokens}); "
+                "requests serve sequentially"
+            )
+            is_batchable = False
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -694,7 +741,19 @@ class ResponseGenerator:
         generation_stream = mx.default_stream(mx.default_device())
 
         # Load the default model if it is given
-        self.model_provider.load_default()
+        try:
+            self.model_provider.load_default()
+        except Exception:
+            if getattr(self.model_provider.cli_args, "prefill_2box", None):
+                # Fail fast and loud: without this the generation thread dies
+                # and every request would hang instead of erroring.
+                import os
+
+                logging.exception(
+                    "[prefill_2box] startup model/runner init failed; exiting"
+                )
+                os._exit(1)
+            raise
 
         current_model = None
         current_sampling = None
@@ -984,6 +1043,37 @@ class ResponseGenerator:
                     cache += [model.make_mtp_cache()]
                 elif self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # Opt-in two-box prefill: run layers [0, split) on the remote box
+            # and [split, n) here, advancing `cache` in place up to the last
+            # prompt token; decode below stays single-box. Only when the
+            # un-cached suffix is long enough to win.
+            tb = self.model_provider.prefill_2box
+            if tb is not None and tb.applicable(len(rest)):
+                if use_mtp or draft_model is not None:
+                    raise ValueError(
+                        "--prefill-2box is plain-decode only (v1); disable "
+                        "MTP/speculative options."
+                    )
+                start = len(prompt) - len(rest)
+                stats = tb.prefill_into(
+                    cache, prompt[:-1], start, progress=progress
+                )
+                n_new = len(prompt) - 1 - start
+                logging.info(
+                    "[prefill_2box] prompt %d: cached %d, prefilled %d "
+                    "(runner resumed at %s) in %.3fs (%.1f tok/s), "
+                    "cache install %.3fs (%.1f MB)",
+                    len(prompt),
+                    start,
+                    n_new,
+                    stats["resumed_at"],
+                    stats["t_pipeline"],
+                    n_new / max(stats["t_pipeline"], 1e-9),
+                    stats["t_cache_install"],
+                    stats["cache_wire_bytes"] / 1e6,
+                )
+                rest = prompt[-1:]
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1934,7 +2024,62 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--prefill-2box",
+        type=str,
+        default=None,
+        metavar="HOST:PORT",
+        help="Opt-in two-box prefill: route prompt prefill through the "
+        "layer-slice runner at HOST:PORT (python -m mlx_lm.prefill_2box.server "
+        "on the remote box, same model, layers [0, split)). Decode stays on "
+        "this box. Plain decode only; disables batching (sequential serving).",
+    )
+    parser.add_argument(
+        "--prefill-2box-split",
+        type=int,
+        default=32,
+        help="Layer split point: remote box runs [0, split), local [split, n).",
+    )
+    parser.add_argument(
+        "--prefill-2box-chunk",
+        type=int,
+        default=1024,
+        help="Two-box prefill chunk size (uniform schedule).",
+    )
+    parser.add_argument(
+        "--prefill-2box-min-tokens",
+        type=int,
+        default=4096,
+        help="Use two-box prefill only when the un-cached prompt suffix has at "
+        "least this many tokens; shorter prefills run single-box.",
+    )
     args = parser.parse_args()
+    if args.prefill_2box:
+        if args.mtp:
+            parser.error(
+                "--prefill-2box cannot be combined with --mtp: v1 is plain "
+                "decode only (the two-box prefill does not fill the MTP cache)."
+            )
+        if args.draft_model:
+            parser.error(
+                "--prefill-2box cannot be combined with --draft-model: v1 is "
+                "plain decode only."
+            )
+        # Fail fast if the remote runner is down (clear error before loading
+        # a large model).
+        from .prefill_2box.serving import parse_hostport, probe_runner
+
+        try:
+            host, port = parse_hostport(args.prefill_2box)
+            ack = probe_runner(host, port)
+        except Exception as e:
+            parser.error(str(e))
+        if ack.get("lo") != 0 or ack.get("hi") != args.prefill_2box_split:
+            parser.error(
+                f"--prefill-2box runner serves layers [{ack.get('lo')}, "
+                f"{ack.get('hi')}), expected [0, {args.prefill_2box_split}). "
+                "Fix --prefill-2box-split or restart the runner."
+            )
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
