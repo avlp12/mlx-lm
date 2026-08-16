@@ -176,6 +176,10 @@ def enable(model: Any = None) -> None:
     _ORIGINAL_CALL = nn.QuantizedLinear.__call__
 
     def __call__(self, x):
+        # 커널은 affine(scales+biases) 전용 — nvfp4/mxfp4 등 다른 모드의 층은
+        # biases 가 없어 KeyError 로 죽는다(community 빌드 KL 측정에서 실증).
+        if "biases" not in self or getattr(self, "mode", "affine") != "affine":
+            return _ORIGINAL_CALL(self, x)
         y = fast_qmm(
             x,
             self["weight"],
