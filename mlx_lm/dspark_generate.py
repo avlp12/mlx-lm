@@ -90,6 +90,13 @@ def dspark_generate_step(
     max_width: Optional[int] = 8,
     pad_lm: bool = True,
     use_conf: bool = False,
+    # read_last: also read the drafter's output at the LAST mask slot, so a
+    # width-`block_size` draft forward yields `block_size` drafts — the
+    # reference s=0 convention (mlx-dspark config anchor-as-pos0 lineage).
+    # The shipped default discards that slot (block 8 -> 7 drafts), which made
+    # the historical "b8 > b7" reading a 7-vs-6-draft comparison. Opt-in so
+    # the default path stays byte-identical; used for the b7/cap7 A/B.
+    read_last: bool = False,
     defer_sync: bool = True,
     # "carry" (default): snapshot + pending-carry rollback, the measured
     # operating point. "rerun": capture-and-rerun — trim the caches to the
@@ -110,7 +117,7 @@ def dspark_generate_step(
     # prompts. Block 9 accepts *more* (3.55 vs 3.46) and still loses, because
     # the wider draft costs more than the extra acceptance returns.
     block_size = block_size or min(draft.block_size + 1, max_width or 8)
-    n_spec = block_size - 1
+    n_spec = block_size if read_last else block_size - 1
     mask_id = draft.mask_token_id
     sampler = sampler or (lambda lg: mx.argmax(lg, axis=-1))
     # temp > 0 switches acceptance from "the argmax matched" to Leviathan
@@ -257,7 +264,7 @@ def dspark_generate_step(
             ctx = taps_cat[:, dend - taps_base : p_last - taps_base, :]
             block = mx.concatenate(
                 [mx.array([[pending[-1]]]),
-                 mx.full((1, n_spec), mask_id, dtype=mx.int32)],
+                 mx.full((1, block_size - 1), mask_id, dtype=mx.int32)],
                 axis=1,
             )
             h = draft(embed(block), ctx, k_offset=dend, q_offset=p_last, cache=dcache)
