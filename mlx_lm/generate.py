@@ -1038,6 +1038,7 @@ def stream_generate(
     mtp_spec_top_k: Optional[int] = None,
     mtp_spec_top_p: Optional[float] = None,
     mtp_spec_draft_temp: Optional[float] = None,
+    mtp_min_draft_p: Optional[float] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -1059,6 +1060,10 @@ def stream_generate(
         mtp_num_draft_tokens (int): Chained MTP draft tokens per step. Default: 2.
         mtp_hybrid (bool): Also enable conservative prompt-lookup drafting
           (helps repetition-heavy workloads). Default: ``False``.
+        mtp_min_draft_p (Optional[float]): p-min chain gate — stop chaining
+          drafts once the candidate's chain probability falls below this
+          threshold (llama.cpp ``--draft-p-min`` contract). Lossless for the
+          committed text; only shortens draft chains. Default: ``None`` (off).
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -1099,6 +1104,7 @@ def stream_generate(
             spec_top_k=mtp_spec_top_k,
             spec_top_p=mtp_spec_top_p,
             spec_draft_temp=mtp_spec_draft_temp,
+            min_draft_p=mtp_min_draft_p,
             **kwargs,
         )
     elif draft_model is None:

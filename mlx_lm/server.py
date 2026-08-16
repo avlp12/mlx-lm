@@ -1026,6 +1026,16 @@ class ResponseGenerator:
             use_mtp = getattr(self.cli_args, "mtp", False) and getattr(
                 model, "has_mtp", False
             )
+            if use_mtp and logits_processors:
+                # The MTP spec loop does not support logits processors
+                # (penalties / logit_bias) — fall back to plain decode for
+                # this request instead of erroring the whole request.
+                logging.warning(
+                    "[mtp] request uses logits processors (penalties or "
+                    "logit_bias); falling back to plain decode for this "
+                    "request."
+                )
+                use_mtp = False
             if use_mtp:
                 # v1: MTP mode skips prompt-cache reuse — the spec loop can end
                 # mid-verify (uncommitted tail entries), which would poison the
@@ -1075,6 +1085,19 @@ class ResponseGenerator:
                 )
                 rest = prompt[-1:]
 
+            # 기각-샘플링 수락은 분포 무손실 — 순수-온도뿐 아니라 top-p/top-k
+            # 절단 샘플러도 절단-인지 기각-샘플링(p'·q' 양쪽 동일 절단 체인,
+            # 포크 58ae6ec)이 정확히 보존한다. 구 k==1 제한은 절단-인지 이전
+            # 시대의 [I198] 실측에 근거했고, exp4 [I76]/[I77]에서 k=4 체인이
+            # t1·tp.95·tk20 실기본값으로 검증됨 — 제한 철폐. min-p/xtc 는
+            # 절단 체인 밖이므로 equality 수락으로 폴백(spec_temp=0).
+            mtp_rejection_ok = (
+                use_mtp
+                and args.sampling.temperature > 0
+                and args.sampling.min_p == 0.0
+                and args.sampling.xtc_probability == 0.0
+            )
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
@@ -1089,20 +1112,25 @@ class ResponseGenerator:
                 mtp=use_mtp,
                 mtp_num_draft_tokens=getattr(self.cli_args, "mtp_num_draft_tokens", 2),
                 mtp_hybrid=getattr(self.cli_args, "mtp_hybrid", False),
-                # 순수-온도 샘플러 + k=1일 때만 기각-샘플링 수락(분포 무손실).
-                # k≥2 체인은 샘플-드래프트가 앵커 품질을 훼손해 equality가 우세
-                # ([I198]); top-p/top-k/min-p/xtc가 걸리면 0(equality 폴백).
                 mtp_spec_temp=(
-                    args.sampling.temperature
-                    if use_mtp
-                    and getattr(self.cli_args, "mtp_num_draft_tokens", 2) == 1
-                    and args.sampling.temperature > 0
-                    and args.sampling.top_p >= 1.0
-                    and args.sampling.top_k <= 0
-                    and args.sampling.min_p == 0.0
-                    and args.sampling.xtc_probability == 0.0
-                    else 0.0
+                    args.sampling.temperature if mtp_rejection_ok else 0.0
                 ),
+                mtp_spec_top_p=(
+                    args.sampling.top_p
+                    if mtp_rejection_ok and 0.0 < args.sampling.top_p < 1.0
+                    else None
+                ),
+                mtp_spec_top_k=(
+                    args.sampling.top_k
+                    if mtp_rejection_ok and args.sampling.top_k > 0
+                    else None
+                ),
+                mtp_spec_draft_temp=(
+                    getattr(self.cli_args, "mtp_spec_draft_temp", None)
+                    if mtp_rejection_ok
+                    else None
+                ),
+                mtp_min_draft_p=getattr(self.cli_args, "mtp_min_draft_p", None),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1929,6 +1957,23 @@ def main():
         "--mtp-hybrid",
         action="store_true",
         help="With --mtp: also enable conservative prompt-lookup drafting.",
+    )
+    parser.add_argument(
+        "--mtp-min-draft-p",
+        type=float,
+        default=None,
+        help="With --mtp: p-min chain gate — stop chaining drafts once the "
+        "candidate's chain probability falls below this threshold "
+        "(llama.cpp --draft-p-min contract). Lossless for the committed "
+        "text; uncertain spans degrade to near-plain steps.",
+    )
+    parser.add_argument(
+        "--mtp-spec-draft-temp",
+        type=float,
+        default=None,
+        help="With --mtp: reshape only the draft proposal temperature for "
+        "rejection sampling (default: the request's temperature). Trades "
+        "acceptance, never the output distribution.",
     )
     parser.add_argument(
         "--trust-remote-code",
