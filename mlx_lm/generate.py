@@ -324,6 +324,20 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def _supports_num_logits(model) -> bool:
+    """Whether `model.__call__` can be told how many trailing logits to compute.
+
+    Prefill chunks are consumed for their KV/recurrent state; their logits are
+    discarded. Computing them anyway costs a full output-head pass per chunk —
+    79.4 ms for 512 rows against 4.25 ms for one on a 248k vocabulary. Models
+    that accept `num_logits` skip that work; the rest keep the old behaviour.
+    """
+    try:
+        return "num_logits" in inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -405,13 +419,19 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+    _num_logits_ok = _supports_num_logits(model)
+
+    def _model_call(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array],
+        num_logits: Optional[int] = None,
+    ):
+        kw = {"cache": prompt_cache}
         if input_embeddings is not None:
-            return model(
-                input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
-            )
-        else:
-            return model(input_tokens, cache=prompt_cache)
+            kw["input_embeddings"] = input_embeddings
+        if num_logits is not None and _num_logits_ok:
+            kw["num_logits"] = num_logits
+        return model(input_tokens, **kw)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
@@ -441,12 +461,27 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
+    # Depth-1 prefill pipelining: submit chunk k+1's graph before blocking on
+    # chunk k, so graph build + encode overlaps GPU execution. All work is on
+    # the single generation_stream, so issue order preserves inter-chunk
+    # dependencies (chunk k+1 reads the cache's lazy state arrays from k).
+    # clear_cache() is hoisted out of the loop: calling it between in-flight
+    # chunks would release just-freed buffers and force fresh Metal
+    # allocations every chunk. Peak transient memory rises by ~one chunk's
+    # activations. Measured on epsilon (q4v, 8192@2048): +0.09% — noise-level,
+    # because the prefill is compute-saturated and boundaries are only
+    # ~5-15ms each. Default OFF (opt-in via MLX_PREFILL_PIPELINE=1); kept for
+    # environments with many small chunks where boundary count grows.
+    _pipeline = os.environ.get("MLX_PREFILL_PIPELINE", "0") == "1"
+
     with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        in_flight = None
+        in_flight_n = 0
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
@@ -457,17 +492,33 @@ def generate_step(
                     if input_embeddings is not None
                     else None
                 ),
+                num_logits=1,
             )
             quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
-            prompt_processed_tokens += n_to_process
-            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            if _pipeline:
+                states = [c.state for c in prompt_cache]
+                mx.async_eval(states)
+                if in_flight is not None:
+                    mx.eval(in_flight)
+                    prompt_progress_callback(in_flight_n, total_prompt_tokens)
+                in_flight = states
+                prompt_processed_tokens += n_to_process
+                in_flight_n = prompt_processed_tokens
+            else:
+                mx.eval([c.state for c in prompt_cache])
+                prompt_processed_tokens += n_to_process
+                prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
             input_embeddings = (
                 input_embeddings[n_to_process:]
                 if input_embeddings is not None
                 else input_embeddings
             )
+            if not _pipeline:
+                mx.clear_cache()
+        if in_flight is not None:
+            mx.eval(in_flight)
+            prompt_progress_callback(in_flight_n, total_prompt_tokens)
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
@@ -701,6 +752,7 @@ def mtp_speculative_generate_step(
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     spec_temp: float = 0.0,
+    min_draft_p: Optional[float] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
@@ -753,8 +805,27 @@ def mtp_speculative_generate_step(
     else:
         model_cache = prompt_cache[:-1]
         mtp_cache = prompt_cache[-1]
-    if not cache.can_trim_prompt_cache(model_cache):
-        raise ValueError("MTP speculative decoding requires a trimmable cache.")
+    # [I232] 하이브리드(선형 어텐션) 지원: 되감기 불가 캐시는 스냅샷/복원으로 처리.
+    # MLX 배열 불변성 덕에 스냅샷은 참조 저장 = 무비용(K3 k3_serve 패턴 이식).
+    _trimmable = cache.can_trim_prompt_cache(model_cache)
+
+    def _snap():
+        s = []
+        for c in model_cache:
+            if hasattr(c, "cache"):          # ArraysCache(선형 상태)
+                s.append(("a", list(c.cache), getattr(c, "lengths", None)))
+            else:                             # KVCache
+                s.append(("k", c.offset))
+        return s
+
+    def _restore(s):
+        for c, st in zip(model_cache, s):
+            if st[0] == "a":
+                c.cache = list(st[1])
+                if st[2] is not None:
+                    c.lengths = st[2]
+            else:
+                c.trim(c.offset - st[1])
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     quantize_cache_fn = functools.partial(
@@ -775,7 +846,8 @@ def mtp_speculative_generate_step(
         processed = 0
         while y.size > 1:
             n_chunk = min(prefill_step_size, y.size - 1)
-            model(y[:n_chunk][None], cache=model_cache)
+            _mtp_kw = {"num_logits": 1} if _supports_num_logits(model) else {}
+            model(y[:n_chunk][None], cache=model_cache, **_mtp_kw)
             h_chunk = model.model._h_prenorm
             model.mtp_forward(h_chunk, y[1:n_chunk + 1][None], cache=mtp_cache)
             quantize_cache_fn(model_cache)
@@ -818,15 +890,34 @@ def mtp_speculative_generate_step(
             logits, g = model.mtp_forward(
                 h_anchor, t_next.reshape(1, 1), cache=mtp_cache, return_hidden=True
             )
-            drafts.append(_draft_pick(logits[0, -1]))
-            for _ in range(k_mtp - 1):
+            cand = _draft_pick(logits[0, -1])
+            while True:
+                # min_draft_p: p-min 체인 게이트(llama.cpp --draft-p-min 계약).
+                # 후보 토큰의 체인-분포(온도 1) 확률이 문턱 미만이면 그 후보를
+                # 버리고 체인을 끊는다. 커밋 토큰은 항상 타깃 로짓에서 나오므로
+                # temp0 텍스트 무손실 — 게이트는 드래프트 길이만 줄인다. 아끼는
+                # 것은 낭비 체인 전방 + 부분 수락 스텝의 복원·재공급 패스(선형
+                # 어텐션은 트림 불가). 게이트를 쓸 때만 체인 스텝당 스칼라 동기
+                # 1회가 든다(min_draft_p=None 이면 종전 경로와 연산 동일).
+                if min_draft_p is not None:
+                    lp = logits[0, -1].astype(mx.float32)
+                    lp = lp - mx.logsumexp(lp)
+                    if float(mx.exp(lp[cand]).item()) < min_draft_p:
+                        del qls[len(drafts):]      # 기각 후보의 q 분포 정리
+                        break
+                drafts.append(cand)
+                if len(drafts) >= k_mtp:
+                    break
                 logits, g = model.mtp_forward(
-                    model.mtp.shared_head(g), drafts[-1].reshape(1, 1),
+                    model.mtp.shared_head(g), cand.reshape(1, 1),
                     cache=mtp_cache, return_hidden=True, **_chain_kwargs,
                 )
-                drafts.append(_draft_pick(logits[0, -1]))
-            chained = k_mtp - 1
+                cand = _draft_pick(logits[0, -1])
+                chained += 1
         k = len(drafts)
+        if not _trimmable:
+            nonlocal snap
+            snap = _snap()
         lg2 = model(mx.stack([t_next] + drafts).reshape(1, k + 1), cache=model_cache)
         h2 = model.model._h_prenorm
         lps = lg2[0] - mx.logsumexp(lg2[0], axis=-1, keepdims=True)
@@ -851,6 +942,7 @@ def mtp_speculative_generate_step(
         mx.async_eval(trues, h2, *drafts)
         return drafts, chained, trues, lps, h2
 
+    snap = None
     ti = int(t.item())
     lp = logprobs0
     with mx.stream(generation_stream):
@@ -869,7 +961,16 @@ def mtp_speculative_generate_step(
         if produced + len(emit) < max_tokens:
             with mx.stream(generation_stream):
                 if k - n > 0:
-                    cache.trim_prompt_cache(model_cache, k - n)
+                    if _trimmable:
+                        cache.trim_prompt_cache(model_cache, k - n)
+                    else:
+                        # 선형 상태는 트림 불가 → 검증 전 스냅샷으로 되돌리고
+                        # 수락분(앵커+수락 드래프트 n개)만 재공급해 상태를 정합화
+                        _restore(snap)
+                        if n >= 0:
+                            model(mx.stack([mx.array(ti, dtype=mx.int64)]
+                                           + d[:n]).reshape(1, n + 1),
+                                  cache=model_cache)
                 if chained:
                     cache.trim_prompt_cache([mtp_cache], chained)
                 for j in range(n):
