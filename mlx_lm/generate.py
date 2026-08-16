@@ -40,7 +40,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import apply_top_k, apply_top_p, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -752,6 +752,9 @@ def mtp_speculative_generate_step(
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     spec_temp: float = 0.0,
+    spec_top_k: Optional[int] = None,
+    spec_top_p: Optional[float] = None,
+    spec_draft_temp: Optional[float] = None,
     min_draft_p: Optional[float] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
@@ -788,9 +791,34 @@ def mtp_speculative_generate_step(
     # preserves the temp-T target distribution while accepting argmax-mismatched
     # tokens the equality rule discards — vendor stacks (vLLM RejectionSampler)
     # report 70-80% acceptance on the same head this way. spec_temp MUST match
-    # the sampler's temperature (top-p/top-k samplers are not supported here —
-    # leave spec_temp=0 for those). Killswitch: MLX_MTP_REJECTION=0.
+    # the sampler's temperature. Truncated samplers are supported through
+    # spec_top_k / spec_top_p: both the target and the draft logits go through
+    # the client's truncation chain — the exact make_sampler order (top-p mask,
+    # then top-k mask, on temp-1 logprobs; temperature last, renormalized) —
+    # giving p', q', and acceptance, residual and bonus all use p'/q'. Pass the
+    # same values the sampler was built with, or the committed bonus token
+    # (drawn by `sampler`) and the acceptance law drift apart. Drafts are
+    # sampled from q' and accepted with that same q'; accepting with the
+    # pre-truncation q would silently break the distribution.
+    # spec_draft_temp (default: spec_temp) reshapes only the proposal q' —
+    # rejection sampling preserves p' for any proposal, so it trades
+    # acceptance, never the output law. Killswitch: MLX_MTP_REJECTION=0.
     rejection = spec_temp > 0.0 and os.environ.get("MLX_MTP_REJECTION", "1") != "0"
+    spec_truncated = (
+        spec_top_k is not None or spec_top_p is not None
+        or spec_draft_temp is not None
+    )
+    _spec_dtemp = spec_draft_temp if spec_draft_temp is not None else spec_temp
+
+    def _spec_trunc(lg, t):
+        z = lg.astype(mx.float32)
+        z = z - mx.logsumexp(z, axis=-1, keepdims=True)
+        if spec_top_p is not None and 0.0 < spec_top_p < 1.0:
+            z = apply_top_p(z, spec_top_p)
+        if spec_top_k is not None and spec_top_k > 0:
+            z = apply_top_k(z, spec_top_k)
+        z = z * (1 / max(t, 1e-6))
+        return z - mx.logsumexp(z, axis=-1, keepdims=True)
     # 체인 재입력이 이미 final_layernorm을 통과한 모델(Motif)은 model.norm 재적용을
     # 건너뛰어야 함(벤더 확정 배선). GLM 등 구계약 모델은 인자 미지원 → 무전달.
     _chain_kwargs = (
@@ -880,8 +908,11 @@ def mtp_speculative_generate_step(
         def _draft_pick(lg):
             if not rejection:
                 return mx.argmax(lg)
-            ql = (lg / spec_temp).astype(mx.float32)
-            ql = ql - mx.logsumexp(ql)
+            if spec_truncated:
+                ql = _spec_trunc(lg, _spec_dtemp)
+            else:
+                ql = (lg / spec_temp).astype(mx.float32)
+                ql = ql - mx.logsumexp(ql)
             qls.append(ql)
             return mx.random.categorical(ql)
 
@@ -926,8 +957,11 @@ def mtp_speculative_generate_step(
             # ai[j] = draft_j if accepted else residual resample. On rejection
             # p(x)<q(x), so (p-q)+ has zero mass at x — the equality test in the
             # main loop then reads acceptance for free from trues alone.
-            plp = (lg2[0, :k] / spec_temp).astype(mx.float32)
-            plp = plp - mx.logsumexp(plp, axis=-1, keepdims=True)
+            if spec_truncated:
+                plp = _spec_trunc(lg2[0, :k], spec_temp)
+            else:
+                plp = (lg2[0, :k] / spec_temp).astype(mx.float32)
+                plp = plp - mx.logsumexp(plp, axis=-1, keepdims=True)
             xs = mx.stack(drafts)
             qlm = mx.stack(qls)
             p_at = mx.take_along_axis(plp, xs[:, None], axis=-1).squeeze(-1)
@@ -1001,6 +1035,9 @@ def stream_generate(
     mtp_num_draft_tokens: int = 2,
     mtp_hybrid: bool = False,
     mtp_spec_temp: float = 0.0,
+    mtp_spec_top_k: Optional[int] = None,
+    mtp_spec_top_p: Optional[float] = None,
+    mtp_spec_draft_temp: Optional[float] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -1059,6 +1096,9 @@ def stream_generate(
             num_draft_tokens=mtp_num_draft_tokens,
             hybrid_lookup=mtp_hybrid,
             spec_temp=mtp_spec_temp,
+            spec_top_k=mtp_spec_top_k,
+            spec_top_p=mtp_spec_top_p,
+            spec_draft_temp=mtp_spec_draft_temp,
             **kwargs,
         )
     elif draft_model is None:

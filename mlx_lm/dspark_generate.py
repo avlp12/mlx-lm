@@ -23,6 +23,7 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 
 from .models.cache import make_prompt_cache
+from .sample_utils import apply_top_k, apply_top_p
 
 
 def _snapshot(cache: List[Any]) -> List[Any]:
@@ -59,6 +60,9 @@ def dspark_generate_step(
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     temp: float = 0.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    draft_temp: Optional[float] = None,
     use_heads: bool = True,
     conf_tau: float = 0.25,
     block_size: Optional[int] = None,
@@ -101,9 +105,42 @@ def dspark_generate_step(
     # resample from (p-q)+. That preserves the temperature-T target distribution
     # exactly while accepting tokens the equality rule throws away — which is the
     # setting the drafter's own acceptance figures were measured in.
+    #
+    # top_k / top_p extend the guarantee to truncated sampling: BOTH the target
+    # and the draft logits go through the client's truncation chain — the exact
+    # make_sampler order (top-p mask, then top-k mask, on temp-1 logprobs;
+    # temperature last, renormalized) — giving p', q'. Acceptance, residual and
+    # bonus all use p'/q'. The load-bearing detail is that drafts are sampled
+    # from q' and accepted with that same q': truncating one side only, or
+    # accepting with the pre-truncation q, silently breaks the distribution.
+    # draft_temp (default: temp) reshapes q' only — rejection sampling
+    # preserves p' for ANY proposal, so the draft temperature is a free knob
+    # that trades acceptance, never the output law. All three default to None,
+    # which is byte-identical to the pre-truncation code path.
     rejection = temp > 0.0
+    truncated = top_k is not None or top_p is not None or draft_temp is not None
 
-    def _logsoftmax(lg):
+    def _trunc_logsoftmax(lg, t):
+        z = lg.astype(mx.float32)
+        z = z - mx.logsumexp(z, axis=-1, keepdims=True)
+        if top_p is not None and 0.0 < top_p < 1.0:
+            z = apply_top_p(z, top_p)
+        if top_k is not None and top_k > 0:
+            z = apply_top_k(z, top_k)
+        z = z * (1 / max(t, 1e-6))
+        return z - mx.logsumexp(z, axis=-1, keepdims=True)
+
+    def _p_logsoftmax(lg):
+        if truncated:
+            return _trunc_logsoftmax(lg, temp)
+        z = (lg / temp).astype(mx.float32)
+        return z - mx.logsumexp(z, axis=-1, keepdims=True)
+
+    def _q_logsoftmax(lg):
+        if truncated:
+            return _trunc_logsoftmax(
+                lg, draft_temp if draft_temp is not None else temp
+            )
         z = (lg / temp).astype(mx.float32)
         return z - mx.logsumexp(z, axis=-1, keepdims=True)
     # Carrying accepted tokens forward is free only while the run is short; a
@@ -149,7 +186,12 @@ def dspark_generate_step(
     )
     taps_base = 0
 
-    first = int(sampler(logits[:, -1, :]).item())
+    if rejection and truncated:
+        # In truncated-rejection mode every committed token is drawn internally
+        # from p'; the first one included, so the caller needs no sampler.
+        first = int(mx.random.categorical(_p_logsoftmax(logits[0, -1, :])).item())
+    else:
+        first = int(sampler(logits[:, -1, :]).item())
     mx.eval(taps_cat)
     yield mx.array([first]), 1
 
@@ -208,31 +250,42 @@ def dspark_generate_step(
             _P("lm_head", base_logits)
             if markov is None:
                 if rejection:
-                    qlp = _logsoftmax(base_logits)
+                    qlp = _q_logsoftmax(base_logits)
                     drafted = mx.random.categorical(qlp).tolist()
                 else:
                     qlp = None
                     drafted = mx.argmax(base_logits, axis=-1).tolist()
                 n_sub = n_avail
-            elif defer_sync and not rejection and conf is None:
+            elif defer_sync and conf is None and (not rejection or truncated):
                 # Same serial bigram chain, but `prev` never leaves the GPU: the
                 # whole chain stays queued and the host reads it once, together
-                # with the target's posterior, after the verify pass.
+                # with the target's posterior, after the verify pass. With
+                # truncated rejection the chain samples each slot from q'
+                # instead of taking the argmax; the RNG call order matches the
+                # synchronous branch below, so defer_sync moves only timing,
+                # never tokens. (Plain temp-only rejection keeps the
+                # synchronous branch it was measured on.)
                 prev = mx.array([pending[-1]])
-                dq = []
+                dq, rows = [], []
                 for j in range(n_avail):
                     z = markov.markov_w1(prev)
                     row = base_logits[j] + markov.markov_w2(z)[0]
-                    prev = mx.argmax(row, keepdims=True)
+                    if rejection:
+                        row = _q_logsoftmax(row)
+                        prev = mx.random.categorical(row).reshape(1)
+                        rows.append(row)
+                    else:
+                        prev = mx.argmax(row, keepdims=True)
                     dq.append(prev)
                 drafted_arr = mx.concatenate(dq)
-                drafted, qlp, n_sub = None, None, n_avail
+                qlp = mx.stack(rows) if rows else None
+                drafted, n_sub = None, n_avail
             else:
                 rows, drafted, zs, prev = [], [], [], pending[-1]
                 for j in range(n_avail):
                     z = markov.markov_w1(mx.array([prev]))
                     lg = base_logits[j] + markov.markov_w2(z)[0]
-                    row = _logsoftmax(lg) if rejection else lg
+                    row = _q_logsoftmax(lg) if rejection else lg
                     prev = int(
                         mx.random.categorical(row).item() if rejection
                         else mx.argmax(row).item()
@@ -275,11 +328,19 @@ def dspark_generate_step(
         _P("verify", logits)
         taps_cat = tapped(model._taps)
         taps_base = base
-        if rejection:
+        if rejection and n_sub == 0:
+            # The width clamp left no room to speculate, so this is a plain
+            # sampled step: one token from the truncated (or plain-temp) target
+            # law. The general path below cannot serve it — there is no q'.
+            # (Pre-truncation code crashed here on qlp=None; the clamp that
+            # creates n_sub == 0 postdates the last temp>0 measurement.)
+            plp = _p_logsoftmax(logits[0, L - 1 : L, :])
+            posterior = [int(mx.random.categorical(plp[0]).item())]
+        elif rejection:
             # Rows L-1 .. L+n_spec-1: one target distribution per draft slot,
             # plus the bonus that follows a fully accepted block.
-            plp = _logsoftmax(logits[0, L - 1 : L + n_sub, :])
-            xs = mx.array(drafted)
+            plp = _p_logsoftmax(logits[0, L - 1 : L + n_sub, :])
+            xs = drafted_arr if drafted is None else mx.array(drafted)
             p_at = mx.take_along_axis(plp[:n_sub], xs[:, None], axis=-1).squeeze(-1)
             q_at = mx.take_along_axis(qlp, xs[:, None], axis=-1).squeeze(-1)
             accept = mx.log(mx.random.uniform(shape=(n_sub,))) < (p_at - q_at)
@@ -289,7 +350,16 @@ def dspark_generate_step(
             # equality test below then reads acceptance off `posterior` for free.
             head = mx.where(accept, xs, res_tok)
             bonus = mx.random.categorical(plp[n_sub])
-            posterior = mx.concatenate([head, bonus.reshape(1)]).tolist()
+            if drafted is None:
+                # Deferred markov chain: the drafts and the verdicts leave the
+                # GPU in the same single transfer, like the greedy defer path.
+                both = mx.concatenate(
+                    [xs.astype(mx.int32), head.astype(mx.int32),
+                     bonus.reshape(1).astype(mx.int32)]
+                ).tolist()
+                drafted, posterior = both[:n_sub], both[n_sub:]
+            else:
+                posterior = mx.concatenate([head, bonus.reshape(1)]).tolist()
         elif drafted is None:
             # One host sync for the whole step: the queued draft chain and the
             # target's posterior are read out of the same transfer.
