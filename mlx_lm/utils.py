@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+import struct
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -19,6 +20,7 @@ from typing import (
     Tuple,
     Type,
     Union,
+    Sequence,
 )
 
 import mlx.core as mx
@@ -516,6 +518,19 @@ def load(
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
+
+    # Route quantized layers through the small-M kernel. It is a no-op outside
+    # the window it wins in (M in [6, 8], N >= 4096, 4-bit, group 64), so plain
+    # decode at M=1 is untouched; what it changes is multi-token verification,
+    # where MLX's own path costs ~5x its M=1 time (ml-explore/mlx#4265).
+    # Wiring it here rather than at the call sites is deliberate: the kernel sat
+    # unused for a whole campaign because every production path — generate,
+    # server, the speculative loops — comes through load() and none of them knew
+    # to ask for it. Opt out with MLXLM_NO_FAST_QMM=1.
+    from . import fast_qmm
+
+    fast_qmm.enable()
+
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
@@ -928,6 +943,7 @@ def dequantize_model(model: nn.Module) -> nn.Module:
 def save_config(
     config: dict,
     config_path: Union[str, Path],
+    keep_vision_config: bool = False,
 ) -> None:
     """Save the model configuration to the ``config_path``.
 
@@ -939,7 +955,13 @@ def save_config(
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
-    config.pop("vision_config", None)
+    # `vision_config` is kept only when the vision weights actually survived
+    # conversion. Keeping it on a stripped checkpoint would advertise a tower
+    # that is not in the file; dropping it when the tower *is* preserved would
+    # hide it. Either mismatch makes the artifact misdescribe itself, and a
+    # 27B VL model already shipped as silently text-only once because of it.
+    if not keep_vision_config:
+        config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
 
@@ -949,6 +971,110 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
+
+
+def save_passthrough_weights(
+    dst_path: Path,
+    src_path: Path,
+    patterns: Sequence[str],
+) -> List[str]:
+    """Carry source tensors the model does not consume into the converted repo.
+
+    A model's ``sanitize`` drops every key its MLX implementation has no module
+    for. That is correct for junk (``rotary_emb.inv_freq``) and wrong for whole
+    towers: a vision tower or an MTP head silently disappears, turning a
+    multimodal or speculative-decoding checkpoint into a plain text model with
+    no diagnostic. Ports are incremental — a tower being unimplemented today is
+    not a reason to destroy its weights on the way through.
+
+    Declaring ``passthrough_patterns`` on a model opts its unconsumed towers
+    into a verbatim byte copy: no dtype cast, no quantization, no re-encoding.
+    Keys the model *did* save are skipped, so this never duplicates a tower that
+    has a real implementation (matching is suffix-aware because sanitize may
+    re-parent a key, e.g. ``mtp.x`` -> ``language_model.mtp.x``).
+
+    Returns the list of keys carried over.
+    """
+    index_path = dst_path / "model.safetensors.index.json"
+    if not index_path.exists():  # single-shard save; nothing to append to
+        return []
+    src_index_path = src_path / "model.safetensors.index.json"
+    if not src_index_path.exists():
+        return []
+
+    with open(src_index_path) as fid:
+        src_map = json.load(fid)["weight_map"]
+    with open(index_path) as fid:
+        dst_index = json.load(fid)
+
+    saved = set(dst_index["weight_map"])
+    def already_saved(key):
+        return key in saved or any(s.endswith("." + key) for s in saved)
+
+    wanted = sorted(
+        k for k in src_map
+        if any(k.startswith(p) for p in patterns) and not already_saved(k)
+    )
+    if not wanted:
+        return []
+
+    def read_header(path):
+        with open(path, "rb") as fid:
+            n = struct.unpack("<Q", fid.read(8))[0]
+            return json.loads(fid.read(n)), 8 + n
+
+    by_shard: Dict[str, List[str]] = {}
+    for k in wanted:
+        by_shard.setdefault(src_map[k], []).append(k)
+
+    blobs, meta = {}, {}
+    for shard, keys in by_shard.items():
+        header, data_start = read_header(src_path / shard)
+        with open(src_path / shard, "rb") as fid:
+            for k in keys:
+                start, end = header[k]["data_offsets"]
+                fid.seek(data_start + start)
+                blobs[k] = fid.read(end - start)
+                meta[k] = {"dtype": header[k]["dtype"], "shape": header[k]["shape"]}
+
+    shard_name = "model-passthrough-00001-of-00001.safetensors"
+    out_header, offset = {}, 0
+    for k in wanted:
+        size = len(blobs[k])
+        out_header[k] = {**meta[k], "data_offsets": [offset, offset + size]}
+        offset += size
+    header_bytes = json.dumps(out_header, separators=(",", ":")).encode()
+    header_bytes += b" " * ((-(8 + len(header_bytes))) % 8)  # 8-byte align data
+    tmp = dst_path / f".{shard_name}.tmp"
+    with open(tmp, "wb") as fid:
+        fid.write(struct.pack("<Q", len(header_bytes)))
+        fid.write(header_bytes)
+        for k in wanted:
+            fid.write(blobs[k])
+    os.replace(tmp, dst_path / shard_name)
+
+    # Verify the bytes landed intact before advertising them in the index — a
+    # half-written passthrough shard that the index points at is worse than none.
+    written, data_start = read_header(dst_path / shard_name)
+    with open(dst_path / shard_name, "rb") as fid:
+        for k in wanted:
+            start, end = written[k]["data_offsets"]
+            fid.seek(data_start + start)
+            if fid.read(end - start) != blobs[k]:
+                os.remove(dst_path / shard_name)
+                raise RuntimeError(f"passthrough verification failed for {k}")
+
+    total = sum(len(v) for v in blobs.values())
+    for k in wanted:
+        dst_index["weight_map"][k] = shard_name
+    dst_index.setdefault("metadata", {})
+    dst_index["metadata"]["total_size"] = (
+        dst_index["metadata"].get("total_size", 0) + total
+    )
+    with open(index_path, "w") as fid:
+        json.dump(dst_index, fid, indent=1)
+    print(f"[INFO] Preserved {len(wanted)} unconsumed tensors ({total / 1e9:.2f} GB)")
+    return wanted
 
 
 def save(
@@ -969,10 +1095,24 @@ def save(
 
     dst_path = Path(dst_path)
     save_model(dst_path, model, donate_model=True)
-    save_config(config, config_path=dst_path / "config.json")
+
+    copy_patterns = ["*.py", "generation_config.json"]
+    kept_vision = False
+    patterns = getattr(model, "passthrough_patterns", ())
+    if patterns:
+        preserved = save_passthrough_weights(dst_path, src_path, patterns)
+        kept_vision = any(".visual." in k or "vision" in k for k in preserved)
+        if preserved:
+            # A preserved tower is unusable without the processor configs that
+            # describe its inputs, so they travel with it.
+            copy_patterns += ["preprocessor_config.json", "*preprocessor_config.json"]
+
+    save_config(
+        config, config_path=dst_path / "config.json", keep_vision_config=kept_vision
+    )
     tokenizer.save_pretrained(dst_path)
 
-    for p in ["*.py", "generation_config.json"]:
+    for p in copy_patterns:
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 

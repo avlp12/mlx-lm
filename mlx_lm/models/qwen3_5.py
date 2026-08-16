@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -138,6 +139,18 @@ class GatedDeltaNet(nn.Module):
     ) -> mx.array:
         B, S, _ = inputs.shape
 
+        # The recurrent path takes a (B, S) validity mask, as built by
+        # create_ssm_mask. Callers that drive decoder layers directly -- AWQ
+        # calibration builds one attention mask for the whole model -- can hand
+        # us an attention mask ("causal", or a (S, S) array) instead. That mask
+        # carries nothing the scan can use, so drop it here. Forwarding it is
+        # not merely useless: the fused scan kernel indexes the mask flat, so a
+        # (S, S) array is silently consumed as garbage instead of erroring.
+        if mask is not None and (
+            not isinstance(mask, mx.array) or mask.shape != (B, S)
+        ):
+            mask = None
+
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
@@ -191,7 +204,10 @@ class GatedDeltaNet(nn.Module):
             self.dt_bias,
             state,
             mask,
-            use_kernel=not self.training,
+            # [I233] 융합 커널은 VJP 미구현 — 민감도 추정/미분이 필요한 경로에서는
+            # MLX_QWEN35_NO_KERNEL=1 로 미분 가능 경로 강제(K3 _DETACH_KDA 교훈).
+            use_kernel=(not self.training
+                        and os.environ.get("MLX_QWEN35_NO_KERNEL") != "1"),
         )
 
         if cache is not None:
@@ -269,6 +285,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        tap_layers: Optional[List[int]] = None,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -292,9 +309,17 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
 
-        for layer, c in zip(self.pipeline_layers, cache):
+        # A speculative drafter (DSpark/DFlash) is fed intermediate hidden
+        # states, not just the final one. Collecting them costs nothing when
+        # unused, and the alternative — re-running the target — is the whole
+        # cost the drafter exists to avoid.
+        taps = {} if tap_layers is None else {i: None for i in tap_layers}
+
+        for e, (layer, c) in enumerate(zip(self.pipeline_layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            if e in taps:
+                taps[e] = hidden_states
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -313,7 +338,46 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        self._h_prenorm = hidden_states        # [I231] MTP 앵커 = final-norm 이후(vLLM 계약)
+        # 탭은 별도 속성으로 넘긴다 — 반환 시그니처를 바꾸면 이 모델을 부르는
+        # 모든 경로(생성·서버·MTP·투기 루프)가 함께 깨진다.
+        self._taps = taps
+        return hidden_states
+
+
+class Qwen3_5MtpBlock(nn.Module):
+    """MTP 내부 트랜스포머 1층(풀 어텐션 + MLP) — 키 mtp.layers.0.*"""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        h = args.hidden_size
+        self.self_attn = Attention(args)
+        self.mlp = MLP(h, args.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(h, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(h, eps=args.rms_norm_eps)
+
+
+class Qwen3_5Mtp(nn.Module):
+    """벤더 동봉 MTP(nextn) 헤드 — DeepSeek-V3 계열 배선([I231]).
+
+    h' = fc([pre_fc_norm_hidden(h) ; pre_fc_norm_embedding(emb(t+1))])
+       → 트랜스포머 1층(풀 어텐션) → norm → 공유 lm_head
+    체크포인트 키: mtp.fc / mtp.pre_fc_norm_{hidden,embedding} / mtp.layers.0.* / mtp.norm
+    """
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        h = args.hidden_size
+        self.pre_fc_norm_hidden = nn.RMSNorm(h, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(h, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(2 * h, h, bias=False)
+        self.layers = [Qwen3_5MtpBlock(args)]      # 체크포인트 키 mtp.layers.0.*
+        self.norm = nn.RMSNorm(h, eps=args.rms_norm_eps)
+
+    @property
+    def shared_head(self):
+        return self.norm
 
 
 class TextModel(nn.Module):
@@ -324,14 +388,50 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.mtp = Qwen3_5Mtp(args) if getattr(args, "with_mtp", True) else None
+
+    @property
+    def has_mtp(self):
+        return self.mtp is not None and self.mtp.fc.weight.size > 0
+
+    def make_mtp_cache(self):
+        return KVCache()
+
+    def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
+        """드래프트 로짓: 백본 pre-norm hidden + 커밋 토큰(t+1 페어링).
+        체인은 mtp.norm 출력을 pre_normed=True로 직결(재-norm 금지)."""
+        emb = self.model.embed_tokens(tokens)
+        h_ = h_prev.astype(emb.dtype)
+        hn = self.mtp.pre_fc_norm_hidden(h_)   # 체인 스텝에서도 항상 적용
+        x = self.mtp.fc(mx.concatenate(
+            [self.mtp.pre_fc_norm_embedding(emb), hn], axis=-1))
+        mask = None
+        if x.shape[1] > 1:
+            mask = create_attention_mask(x, cache, return_array=True)
+        blk = self.mtp.layers[0]
+        h1 = x + blk.self_attn(blk.input_layernorm(x), mask, cache)
+        h2 = h1 + blk.mlp(blk.post_attention_layernorm(h1))
+        logits = self.lm_head(self.mtp.norm(h2))
+        return (logits, h2) if return_hidden else logits
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        tap_layers: Optional[List[int]] = None,
+        num_logits: Optional[int] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model(
+            inputs, cache, input_embeddings=input_embeddings, tap_layers=tap_layers
+        )
+        self._taps = self.model._taps
+        # Prefill chunks are consumed for their cache, not their logits, yet the
+        # output head runs over every position: 79.4 ms for 512 rows against
+        # 4.25 ms for one, on a 248k vocabulary. `num_logits` keeps only the tail
+        # the caller will actually read.
+        if num_logits is not None and num_logits < out.shape[1]:
+            out = out[:, -num_logits:, :]
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -346,12 +446,14 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
+        # [CA79] mtp 키 존재를 raw-HF 신호로 쓰면 **MTP 보존 빌드에서 영구 참**이 되어
+        # 변환 때 이미 시프트된 norm에 로드 때 또 +1.0이 붙는다(감마 0.944→1.944→2.944).
+        # conv1d 형상만이 raw-HF의 신뢰 가능한 판별자다.
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        should_shift_norm_weights = has_unsanitized_conv1d
+        # [I231] MTP 보존(종전에는 폐기). language_model.mtp.* 로 매핑되어 들어옴.
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -362,6 +464,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -417,21 +522,52 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        tap_layers: Optional[List[int]] = None,
+        num_logits: Optional[int] = None,
     ):
-        return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+        out = self.language_model(
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            tap_layers=tap_layers,
+            num_logits=num_logits,
         )
+        self._taps = self.language_model._taps
+        return out
 
     @property
     def model(self):
         return self.language_model.model
 
+    # ── MTP 자기-투기 계약 위임([I231])
+    @property
+    def has_mtp(self):
+        return self.language_model.has_mtp
+
+    @property
+    def mtp(self):
+        return self.language_model.mtp
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_forward(self, *a, **kw):
+        return self.language_model.mtp_forward(*a, **kw)
+
+    # Towers this text-only port has no modules for, but whose weights must
+    # survive conversion (see utils.save_passthrough_weights). Dropping them
+    # turns a multimodal checkpoint into a text-only one with no diagnostic;
+    # `mtp.` is listed for stock mlx-lm, and is a no-op here because this port
+    # implements the MTP head and therefore already saves those tensors.
+    passthrough_patterns = ("model.visual.", "vision_tower.", "mtp.")
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
+            # Vision weights are not consumed by this text-only port; they are
+            # dropped here (nothing to load them into) and preserved at save
+            # time from the source checkpoint instead.
             if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.visual"):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")

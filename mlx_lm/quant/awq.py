@@ -152,11 +152,40 @@ glm_moe_dsa_awq.scale_configs = [
 ]
 
 
+
+# [I234] Qwen3.8 / Qwen3.5 (qwen3_5) — 하이브리드: 16층 full attention(self_attn) +
+# 48층 GatedDeltaNet(linear_attn). AWQ는 전방-패스 전용이라 융합 스캔 커널을 그대로 쓸 수
+# 있다(경사 기반 DWQ·민감도는 GatedDeltaNet VJP 부재로 사용 불가 — [CA80]).
+# 선형-어텐션 층의 in/out proj는 conv1d·게이팅과 얽혀 있어 스케일 대상에서 제외하고,
+# 공통 MLP와 full-attn 사영만 보정한다(보수적 = 안전).
+qwen3_5_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "k_proj"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "k_proj", "v_proj"],
+            kwargs=["mask"],
+        ),
+        ScaleConfig(prev="mlp.up_proj", layers=["mlp.down_proj"]),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+        ),
+    ],
+)
+
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
     "qwen2": llama_awq,
     "qwen3": llama_awq,
+    # [I234] VL 래퍼(Model.language_model) 아래에 있으므로 lm_key 필요 — 없으면
+    #  lm_head가 bf16으로 남아 크기 +2.5GB(품질 이득이 알고리즘 덕인지 흐려진다)
+    "qwen3_5": update(qwen3_5_awq, lm_key="language_model"),
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
@@ -302,8 +331,17 @@ def scale_block(
     for conf in configs:
         if conf.use_config is not None and not conf.use_config(block):
             continue
+        try:                                   # prev 모듈이 없는 층도 건너뛴다
+            submodule_from_key(block, conf.prev)
+        except (KeyError, AttributeError):
+            continue
         if conf.block is not None:
-            local_block = block[conf.block]
+            # [I234] 하이브리드 아키텍처(예: qwen3_5는 층마다 self_attn 또는 linear_attn)
+            # 에서는 특정 블록이 없는 층이 있다. 그 층에서는 해당 스케일 설정만 건너뛴다.
+            try:
+                local_block = block[conf.block]
+            except KeyError:
+                continue
             layers = [submodule_from_key(local_block, l) for l in conf.layers]
         else:
             local_block = None
