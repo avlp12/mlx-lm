@@ -16,6 +16,14 @@ per step, which costs more than the speculation wins (measured: 0.4x plain).
 So the replay is not performed. Accepted-but-unreplayed tokens are carried in
 `pending` and prepended to the *next* step's verification, which the target has
 to run anyway. That is one target pass per step at any acceptance rate.
+
+`rollback="rerun"` replaces that design with capture-and-rerun (mlx-dspark
+lineage): the verify forward records each recurrent layer's scan inputs and
+pre-round state, and a partial acceptance re-runs the small per-layer
+recurrence over just the accepted prefix — KV layers simply trim. The carry
+tax disappears: `pending` stays at length 1, so every round drafts a full
+fresh block instead of losing slots to carried tokens. The cost moves to one
+tiny kernel per recurrent layer per rejection.
 """
 
 from typing import Any, Callable, Generator, List, Optional, Tuple
@@ -83,6 +91,11 @@ def dspark_generate_step(
     pad_lm: bool = True,
     use_conf: bool = False,
     defer_sync: bool = True,
+    # "carry" (default): snapshot + pending-carry rollback, the measured
+    # operating point. "rerun": capture-and-rerun — trim the caches to the
+    # accepted prefix and replay only the recurrent scan per layer. Opt-in so
+    # the default path stays byte-identical to what was shipped.
+    rollback: str = "carry",
     stats: Optional[dict] = None,
     prof: Optional[dict] = None,
 ) -> Generator[Tuple[mx.array, int], None, None]:
@@ -199,6 +212,18 @@ def dspark_generate_step(
     base = int(prompt.size)   # the target cache covers [0, base)
     pending = [first]         # committed; positions [base, base + len(pending))
     dend = 0                  # the draft cache holds context for [0, dend)
+
+    if rollback not in ("carry", "rerun"):
+        raise ValueError(f"rollback must be 'carry' or 'rerun', got {rollback!r}")
+    rerun = rollback == "rerun"
+    # The recurrent layers that need scan capture, paired with tcache by
+    # position. Capture is toggled around each verify call only — enabling it
+    # globally would pin chunk-sized tensors during any later prefill.
+    gdn = (
+        [l.linear_attn for l in model.layers if getattr(l, "is_linear", False)]
+        if rerun
+        else []
+    )
 
     import time as _time
 
@@ -318,13 +343,19 @@ def dspark_generate_step(
 
         # ── Verify. `pending` rides at the front of the batch: the target has to
         # run anyway, and carrying it here is what removes the replay pass.
-        snap = _snapshot(tcache)
+        snap = None if rerun else _snapshot(tcache)
         vin = (
             mx.concatenate([mx.array(pending), drafted_arr.astype(mx.int32)])[None]
             if drafted is None
             else mx.array([pending + drafted])
         )
+        if rerun:
+            for g in gdn:
+                g._dspark_capture = True
         logits = model(vin, cache=tcache, tap_layers=tap_layers)
+        if rerun:
+            for g in gdn:
+                g._dspark_capture = False
         _P("verify", logits)
         taps_cat = tapped(model._taps)
         taps_base = base
@@ -393,6 +424,23 @@ def dspark_generate_step(
             # cache is already correct — a good drafter pays off twice here.
             base += L + n_sub
             pending = [emitted[-1]]
+        elif rerun:
+            # Capture-and-rerun: the verify already computed everything the
+            # accepted prefix needs. KV layers keep their first `n_keep` rows
+            # (a trim); recurrent layers replay the captured scan over that
+            # prefix from the pre-round state. Nothing is carried: the next
+            # round drafts a full fresh block from the correction token.
+            n_keep = L + n_acc
+            n_drop = (L + n_sub) - n_keep
+            for c, lyr in zip(tcache, model.layers):
+                if getattr(lyr, "is_linear", False):
+                    lyr.linear_attn.dspark_rerun(c, n_keep)
+                else:
+                    c.trim(n_drop)
+            base += n_keep
+            pending = [emitted[-1]]
+            if stats is not None:
+                stats["rerun"] = stats.get("rerun", 0) + 1
         else:
             _rewind(tcache, snap)
             pending = pending + emitted

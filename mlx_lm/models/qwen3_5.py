@@ -319,6 +319,14 @@ class GatedDeltaNet(nn.Module):
         self._fused_tried = False
         self._fold_w = None
 
+        # capture-and-rerun 롤백(DSpark [PA23]①, mlx-dspark 계보 [I65]) —
+        # 투기 루프가 True 로 켜면 매 forward 의 스캔 입력과 pre-round 상태를
+        # 보관한다. 부분 수락 시 dspark_rerun() 이 수락 접두만으로 recurrence 를
+        # 재실행해 상태를 복원한다 — pending-carry 의 재공급 세금이 사라진다.
+        # 기본 False: 미사용 시 분기 1회 외 비용 0.
+        self._dspark_capture = False
+        self._dspark_scan = None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -424,6 +432,14 @@ class GatedDeltaNet(nn.Module):
             q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        if self._dspark_capture:
+            # 스캔 입력은 conv·norm 통과 후의 값이라 위치별(row-wise) 연산만
+            # 남았다 — 접두 슬라이스가 곧 "그 접두만 처리했을 때의 입력"이다.
+            # conv_input 은 pre-round conv 상태의 재구성용([:, :K-1] = 구 상태,
+            # 이후 행 = 이번 배치의 qkv). state 는 아직 갱신 전 참조(mx.array
+            # 불변이라 아래 cache[1] 덮어쓰기와 무관하게 유효).
+            self._dspark_scan = (q, k, v, a, b, conv_input, state)
+
         out, state = gated_delta_update(
             q,
             k,
@@ -451,6 +467,33 @@ class GatedDeltaNet(nn.Module):
             out = mx.distributed.all_sum(out, group=self.sharding_group)
 
         return out
+
+    def dspark_rerun(self, cache, n_keep: int) -> None:
+        """부분 수락 롤백: 직전 캡처의 수락 접두 `n_keep` 행만으로 recurrence 를
+        재실행해 캐시 상태를 복원한다(capture-and-rerun, [I65]).
+
+        pending-carry 대체 경로: 기각 시 상태를 통째로 되감고 수락 토큰을 다음
+        검증에 끌고 가는 대신, pre-round 상태에서 접두만 다시 스캔한다.
+        비용은 층당 소형 커널 1회(S=n_keep ≤ 8) — 풀모델 재공급 세금이 없다.
+        conv 상태는 [구 상태 ‖ 이번 qkv] 연접의 슬라이스로 산술 복원된다.
+        """
+        q, k, v, a, b, conv_input, state0 = self._dspark_scan
+        _, state = gated_delta_update(
+            q[:, :n_keep],
+            k[:, :n_keep],
+            v[:, :n_keep],
+            a[:, :n_keep],
+            b[:, :n_keep],
+            self.A_log,
+            self.dt_bias,
+            state0,
+            None,
+            use_kernel=(not self.training
+                        and os.environ.get("MLX_QWEN35_NO_KERNEL") != "1"),
+        )
+        n_ctx = self.conv_kernel_size - 1
+        cache[0] = mx.contiguous(conv_input[:, n_keep : n_keep + n_ctx, :])
+        cache[1] = state
 
 
 class DecoderLayer(nn.Module):
