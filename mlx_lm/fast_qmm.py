@@ -112,6 +112,88 @@ _SRC = r"""
     }
 """
 
+
+M_WIDE_MAX = 16    # 두 번째 MMA 타일까지 — 가중치 읽기는 M=8 과 동일하다
+# 검증 폭 9-16 은 스톡에서 M=8 대비 3.8배를 문다([I128]). B 타일은 이미
+# threadgroup 에 올라와 있으므로, 행 8-15 를 위한 누산기 하나를 더 두면 그 폭이
+# M=8 의 가중치-읽기 비용을 그대로 나눠 쓴다. 창 안(M<=8) 경로는 손대지 않는다.
+
+_SRC_WIDE = r"""
+    const int K = KD, N = ND, M = MD;
+    const int KPS = KD / 8;
+
+    uint tid  = thread_position_in_threadgroup.x;
+    uint tgid = threadgroup_position_in_grid.x;
+    uint sg   = tid >> 5;
+    uint lane = tid & 31;
+
+    int n0 = (int)tgid * 8;
+
+    threadgroup bfloat16_t bs[8 * 512];     // B 타일 — 두 행-타일이 공유한다(요점)
+    threadgroup float red[8 * 128];         // 심드그룹 8 x 행타일 2 x 64, 4KB
+
+    simdgroup_matrix<float, 8, 8> C0 = simdgroup_matrix<float, 8, 8>(0);
+    simdgroup_matrix<float, 8, 8> C1 = simdgroup_matrix<float, 8, 8>(0);
+    threadgroup bfloat16_t* bt = bs + sg * 512;
+
+    int kbeg = (int)sg * KPS;
+    for (int kk = 0; kk < KPS; kk += 64) {
+        int ka = kbeg + kk;
+        int j  = (int)(lane & 7);
+        int kq = (int)(lane >> 3);
+        int n  = n0 + j;
+        if (n < N) {
+            int g = ka >> 6;
+            float s  = (float)sc[(size_t)n * (K / 64) + g];
+            float bb = (float)bi[(size_t)n * (K / 64) + g];
+            const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
+            uint p0 = wr[0], p1 = wr[1];
+            for (int t = 0; t < 8; ++t)
+                bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
+            for (int t = 0; t < 8; ++t)
+                bt[(kq * 16 + 8 + t) * 8 + j] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+        } else {
+            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<bfloat16_t, 8, 8> A0, A1, B;
+        for (int kt = 0; kt < 8; ++kt) {
+            simdgroup_load(B,  bt + kt * 64, 8);
+            simdgroup_load(A0, x + ka + kt * 8, K);              // 행 0-7
+            simdgroup_multiply_accumulate(C0, A0, B, C0);
+            simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);  // 행 8-15
+            simdgroup_multiply_accumulate(C1, A1, B, C1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(C0, red + sg * 128, 8);
+    simdgroup_store(C1, red + sg * 128 + 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = (int)tid; i < 128; i += 256) {
+        int m = i >> 3, j = i & 7;          // m 0-15 (0-7 은 C0, 8-15 는 C1 구간)
+        int mm = (m < 8) ? m : (m - 8);
+        int slot = (m < 8) ? (mm * 8 + j) : (64 + mm * 8 + j);
+        int mrow = (m < 8) ? m : m;
+        int n = n0 + j;
+        if (mrow < M && n < N) {
+            float v = 0.0f;
+            for (int q = 0; q < 8; ++q) v += red[q * 128 + slot];
+            out[(size_t)mrow * N + n] = (bfloat16_t)v;
+        }
+    }
+"""
+
+_KERNEL_WIDE = mx.fast.metal_kernel(
+    name="qmm_mma4_wide",
+    input_names=["x", "w", "sc", "bi"],
+    output_names=["out"],
+    source=_SRC_WIDE,
+)
+
+
 _KERNEL = mx.fast.metal_kernel(
     name="qmm_mma4",
     input_names=["x", "w", "sc", "bi"],
@@ -131,6 +213,22 @@ def _eligible(x: mx.array, group_size: int, bits: int, K: int, N: int) -> bool:
     )
 
 
+def _wide_qmm(x, w, scales, biases, *, M: int, K: int, N: int):
+    """M in (8, 16] — 두 행-타일. 창 안 경로와 동일한 형상 규약을 쓴다."""
+    flat = x.reshape(-1, K)
+    if M < 16:                       # 커널은 16행 타일을 device 에서 직접 읽는다
+        flat = mx.concatenate([flat, mx.zeros((16 - M, K), dtype=flat.dtype)], axis=0)
+    (out,) = _KERNEL_WIDE(
+        inputs=[flat, w, scales, biases],
+        template=[("KD", K), ("ND", N), ("MD", M)],
+        output_shapes=[(M, N)],
+        output_dtypes=[mx.bfloat16],
+        grid=(((N + 7) // 8) * TGT, 1, 1),
+        threadgroup=(TGT, 1, 1),
+    )
+    return out.reshape(*x.shape[:-1], N)
+
+
 def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
     """Drop-in for `mx.quantized_matmul(..., transpose=True)` in the small-M window.
 
@@ -142,6 +240,12 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
     for d in x.shape[:-1]:
         M *= d
     N = w.shape[0]
+    if (
+        M_MAX < M <= M_WIDE_MAX
+        and os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
+        and _eligible(x, group_size, bits, K, N)
+    ):
+        return _wide_qmm(x, w, scales, biases, M=M, K=K, N=N)
     if not (M_MIN <= M <= M_MAX and _eligible(x, group_size, bits, K, N)):
         return mx.quantized_matmul(
             x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
