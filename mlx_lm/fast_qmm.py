@@ -229,6 +229,16 @@ def _wide_qmm(x, w, scales, biases, *, M: int, K: int, N: int):
     return out.reshape(*x.shape[:-1], N)
 
 
+# --- 폭 히스토그램 (진단 전용, MLXLM_QMM_HIST=1 로 켠다) ---
+_HIST_ON = os.environ.get("MLXLM_QMM_HIST") == "1"
+_WIDTH_HIST: dict = {}
+
+
+def width_histogram():
+    """M(=검증 폭) 별 호출 수와 어느 경로로 갔는지. 진단용."""
+    return dict(sorted(_WIDTH_HIST.items()))
+
+
 def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
     """Drop-in for `mx.quantized_matmul(..., transpose=True)` in the small-M window.
 
@@ -240,6 +250,8 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
     for d in x.shape[:-1]:
         M *= d
     N = w.shape[0]
+    if _HIST_ON:
+        _WIDTH_HIST[M] = _WIDTH_HIST.get(M, 0) + 1
     if (
         M_MAX < M <= M_WIDE_MAX
         and os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
