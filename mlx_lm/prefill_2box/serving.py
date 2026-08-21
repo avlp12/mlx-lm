@@ -93,7 +93,7 @@ class ServingPrefill:
         chunk=1024,
         min_tokens=4096,
         chunk_long=None,
-        long_tokens=None,
+        long_tokens=11264,
     ):
         self.model = model
         self.host = host
@@ -101,14 +101,13 @@ class ServingPrefill:
         self.split = split
         self.chunk = chunk
         self.min_tokens = min_tokens
-        # Optional second chunk schedule for long prompts.  Both must be set
-        # for the branch to be active; either alone is a configuration error
-        # rather than a silent single-schedule fallback.
-        if (chunk_long is None) != (long_tokens is None):
-            raise TwoBoxError(
-                "chunk_long and long_tokens must be set together "
-                f"(got chunk_long={chunk_long}, long_tokens={long_tokens})"
-            )
+        # Optional second chunk schedule for long prompts.  ``chunk_long`` is
+        # what turns the branch on; ``long_tokens`` defaults to the measured
+        # crossover (see ``chunk_for``).  Asking for the branch without a
+        # threshold is a configuration error rather than a silent
+        # single-schedule fallback.
+        if chunk_long is not None and long_tokens is None:
+            raise TwoBoxError("chunk_long needs a long_tokens threshold")
         self.chunk_long = chunk_long
         self.long_tokens = long_tokens
         self._tb = None
@@ -162,6 +161,14 @@ class ServingPrefill:
         the deeper pipeline bubble.  Below ``long_tokens`` the narrow schedule
         wins outright, so the choice is made per request rather than fixed at
         startup.
+
+        The 11264 default is the measured crossover for 1024 -> 2048 on a 27B
+        hybrid-attention model split across two M3 Ultras with an ANE/CPU
+        offload attached (2048/1024 throughput ratio 0.95 at 8K, 1.00 at 9-10K,
+        1.03 at 11K, 1.11 at 32K).  It is a property of *that* pairing, not a
+        universal one: with the offload off the wide schedule never won
+        anywhere in 8K-32K, which is why ``chunk_long`` stays opt-in.  Re-measure
+        before trusting the default on a different model, split or accelerator.
         """
         if self.chunk_long is not None and n_new_tokens >= self.long_tokens:
             return self.chunk_long

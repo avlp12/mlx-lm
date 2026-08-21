@@ -2145,9 +2145,12 @@ def main():
     parser.add_argument(
         "--prefill-2box-long-tokens",
         type=int,
-        default=None,
+        default=11264,
         help="Suffix length at or above which --prefill-2box-chunk-long is "
-        "used instead of --prefill-2box-chunk.",
+        "used instead of --prefill-2box-chunk. The default is the measured "
+        "crossover for 1024 -> 2048 on a 27B hybrid-attention model across two "
+        "M3 Ultras with an ANE/CPU offload attached; re-measure for a different "
+        "model, split or accelerator.",
     )
     parser.add_argument(
         "--prefill-2box-min-tokens",
@@ -2157,12 +2160,11 @@ def main():
         "least this many tokens; shorter prefills run single-box.",
     )
     args = parser.parse_args()
-    if (args.prefill_2box_chunk_long is None) != (
+    if args.prefill_2box_chunk_long is not None and (
         args.prefill_2box_long_tokens is None
     ):
         parser.error(
-            "--prefill-2box-chunk-long and --prefill-2box-long-tokens must be "
-            "given together"
+            "--prefill-2box-chunk-long needs --prefill-2box-long-tokens"
         )
     if args.prefill_2box:
         if args.mtp:
