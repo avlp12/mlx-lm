@@ -3,7 +3,9 @@
 import argparse
 import json
 import logging
+import os
 import pickle
+import zlib
 import platform
 import socket
 import time
@@ -1016,6 +1018,19 @@ class ResponseGenerator:
             # Seed if requested
             if args.seed is not None:
                 mx.random.seed(args.seed)
+            elif self._is_distributed and os.environ.get("MLXLM_TP_SEED_SYNC") == "1":
+                # Under tensor parallelism every rank runs the same generation
+                # loop in lockstep, so a sampled request whose ranks draw
+                # different randoms commits different tokens, stops at
+                # different times, and deadlocks the next collective. The
+                # batch path syncs the seed with an all_sum; that call hangs
+                # on this backend, so derive the seed instead: both ranks hold
+                # the identical broadcast prompt, so a stable hash of it needs
+                # no communication at all.
+                seed = zlib.crc32(
+                    b"".join(int(t).to_bytes(4, "little") for t in prompt[:512])
+                )
+                mx.random.seed(seed)
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
@@ -1099,6 +1114,7 @@ class ResponseGenerator:
             )
 
             # Process the prompt and generate tokens
+            client_gone = False
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1155,8 +1171,23 @@ class ResponseGenerator:
 
                 if ctx._should_stop:
                     if self._is_distributed:
-                        raise NotImplementedError()
-                    break
+                        # The client went away mid-generation. In distributed
+                        # serving rank 0 cannot break out of the step loop
+                        # unilaterally: the other ranks keep stepping the
+                        # sharded forward and would wedge inside a collective
+                        # waiting for rank 0. Drain the generation to its
+                        # natural end instead (the responses go to a queue
+                        # nobody reads); every rank sees the same
+                        # finish_reason and exits in lockstep.
+                        if not client_gone:
+                            client_gone = True
+                            logging.warning(
+                                "[distributed] client disconnected "
+                                "mid-generation; draining to completion to "
+                                "keep ranks in lockstep"
+                            )
+                    else:
+                        break
 
                 if finish_reason is not None:
                     break
