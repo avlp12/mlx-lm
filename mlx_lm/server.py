@@ -414,12 +414,20 @@ class ModelProvider:
                 split=self.cli_args.prefill_2box_split,
                 chunk=self.cli_args.prefill_2box_chunk,
                 min_tokens=self.cli_args.prefill_2box_min_tokens,
+                chunk_long=self.cli_args.prefill_2box_chunk_long,
+                long_tokens=self.cli_args.prefill_2box_long_tokens,
             )
             logging.info(
                 f"[prefill_2box] connected to {host}:{port} "
                 f"(split {self.cli_args.prefill_2box_split}, "
-                f"chunk {self.cli_args.prefill_2box_chunk}, "
-                f"min_tokens {self.cli_args.prefill_2box_min_tokens}); "
+                f"chunk {self.cli_args.prefill_2box_chunk}"
+                + (
+                    f" -> {self.cli_args.prefill_2box_chunk_long} at "
+                    f">={self.cli_args.prefill_2box_long_tokens} tokens"
+                    if self.cli_args.prefill_2box_chunk_long
+                    else ""
+                )
+                + f", min_tokens {self.cli_args.prefill_2box_min_tokens}); "
                 "requests serve sequentially"
             )
             is_batchable = False
@@ -1087,11 +1095,12 @@ class ResponseGenerator:
                 n_new = len(prompt) - 1 - start
                 logging.info(
                     "[prefill_2box] prompt %d: cached %d, prefilled %d "
-                    "(runner resumed at %s) in %.3fs (%.1f tok/s), "
+                    "at chunk %d (runner resumed at %s) in %.3fs (%.1f tok/s), "
                     "cache install %.3fs (%.1f MB)",
                     len(prompt),
                     start,
                     n_new,
+                    stats["chunk"],
                     stats["resumed_at"],
                     stats["t_pipeline"],
                     n_new / max(stats["t_pipeline"], 1e-9),
@@ -2123,6 +2132,24 @@ def main():
         help="Two-box prefill chunk size (uniform schedule).",
     )
     parser.add_argument(
+        "--prefill-2box-chunk-long",
+        type=int,
+        default=None,
+        help="Second chunk size, used when the un-cached prompt suffix has at "
+        "least --prefill-2box-long-tokens tokens. The two schedules are not "
+        "ordered: a wider chunk amortises fixed per-chunk cost (and is what an "
+        "ANE/CPU offload needs to engage at all) but deepens the pipeline "
+        "bubble, so it only wins once the prompt carries enough chunks. Must "
+        "be given together with --prefill-2box-long-tokens.",
+    )
+    parser.add_argument(
+        "--prefill-2box-long-tokens",
+        type=int,
+        default=None,
+        help="Suffix length at or above which --prefill-2box-chunk-long is "
+        "used instead of --prefill-2box-chunk.",
+    )
+    parser.add_argument(
         "--prefill-2box-min-tokens",
         type=int,
         default=4096,
@@ -2130,6 +2157,13 @@ def main():
         "least this many tokens; shorter prefills run single-box.",
     )
     args = parser.parse_args()
+    if (args.prefill_2box_chunk_long is None) != (
+        args.prefill_2box_long_tokens is None
+    ):
+        parser.error(
+            "--prefill-2box-chunk-long and --prefill-2box-long-tokens must be "
+            "given together"
+        )
     if args.prefill_2box:
         if args.mtp:
             parser.error(

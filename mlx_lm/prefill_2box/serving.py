@@ -15,6 +15,11 @@ Differences from the benchmark orchestrator (``TwoBoxPrefill.prefill``):
     ``send_from``).
   * Connection management: fail-fast probe at server startup, lazy reconnect
     per request afterwards.
+  * The chunk schedule is chosen per request from the length of the un-cached
+    suffix (``chunk_for``).  A wider chunk amortises fixed per-chunk cost and
+    is what an accelerator offload needs to engage at all, but it deepens the
+    pipeline bubble; which one wins depends on how many chunks the prompt has.
+    See ``--prefill-2box-chunk-long`` / ``--prefill-2box-long-tokens``.
 
 Single-turn requests (no reusable prefix) reduce exactly to the verified
 benchmark path: same chunk schedule, same slice code, bitwise-identical.
@@ -79,13 +84,33 @@ def probe_runner(host, port, timeout=5):
 class ServingPrefill:
     """Persistent two-box prefill engine for one loaded server model."""
 
-    def __init__(self, model, host, port, split=32, chunk=1024, min_tokens=4096):
+    def __init__(
+        self,
+        model,
+        host,
+        port,
+        split=32,
+        chunk=1024,
+        min_tokens=4096,
+        chunk_long=None,
+        long_tokens=None,
+    ):
         self.model = model
         self.host = host
         self.port = port
         self.split = split
         self.chunk = chunk
         self.min_tokens = min_tokens
+        # Optional second chunk schedule for long prompts.  Both must be set
+        # for the branch to be active; either alone is a configuration error
+        # rather than a silent single-schedule fallback.
+        if (chunk_long is None) != (long_tokens is None):
+            raise TwoBoxError(
+                "chunk_long and long_tokens must be set together "
+                f"(got chunk_long={chunk_long}, long_tokens={long_tokens})"
+            )
+        self.chunk_long = chunk_long
+        self.long_tokens = long_tokens
         self._tb = None
         self.ensure()  # fail fast at load time
 
@@ -129,6 +154,19 @@ class ServingPrefill:
         """Use two-box only when the un-cached suffix is long enough to win."""
         return n_new_tokens - 1 >= self.min_tokens
 
+    def chunk_for(self, n_new_tokens):
+        """Chunk schedule for a prefill of ``n_new_tokens`` new tokens.
+
+        The branch exists because the two schedules are not ordered: the wider
+        one is faster only once the prompt carries enough chunks to amortise
+        the deeper pipeline bubble.  Below ``long_tokens`` the narrow schedule
+        wins outright, so the choice is made per request rather than fixed at
+        startup.
+        """
+        if self.chunk_long is not None and n_new_tokens >= self.long_tokens:
+            return self.chunk_long
+        return self.chunk
+
     # --------------------------------------------------------------- prefill
     def prefill_into(self, full_cache, tokens, start, progress=None):
         """Advance ``full_cache`` in place from offset ``start`` to len(tokens).
@@ -149,6 +187,7 @@ class ServingPrefill:
         need = P - start
         if need < 1:
             raise TwoBoxError(f"nothing to prefill (P={P}, start={start})")
+        chunk = self.chunk_for(need)
         n_layers = tb.n_layers
         if len(full_cache) != n_layers:
             raise TwoBoxError(
@@ -165,7 +204,9 @@ class ServingPrefill:
                 )
 
         try:
-            return self._prefill_into(tb, full_cache, tokens, P, start, progress)
+            return self._prefill_into(
+                tb, full_cache, tokens, P, start, chunk, progress
+            )
         except Exception:
             # Connection state is unknown mid-protocol: drop and reconnect on
             # the next request.  The supplied cache may be partially advanced
@@ -175,7 +216,7 @@ class ServingPrefill:
         finally:
             local.cache = []
 
-    def _prefill_into(self, tb, full_cache, tokens, P, start, progress):
+    def _prefill_into(self, tb, full_cache, tokens, P, start, chunk, progress):
         local = tb.local
         sock = tb.sock
 
@@ -212,7 +253,7 @@ class ServingPrefill:
             {
                 "op": "prefill2",
                 "tokens": tokens,
-                "chunk": self.chunk,
+                "chunk": chunk,
                 "send_from": start,
             },
         )
@@ -290,6 +331,7 @@ class ServingPrefill:
         return {
             "n_tokens": P,
             "start": start,
+            "chunk": chunk,
             "resumed_at": srv.get("e0"),
             "t_pipeline": t_pipeline,
             "t_cache_install": t_cache,
